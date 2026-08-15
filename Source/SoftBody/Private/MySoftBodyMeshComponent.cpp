@@ -474,7 +474,7 @@ void UMySoftBodyMeshComponent::BuildClothState()
     // 遍历每一个高模顶点，初始化它的物理状态
     for (int32 i = 0; i < HighResParticleCount; ++i)
     {
-        FVector WorldPos = GetComponentLocation() + (FVector)RenderMesh.GetVertex(i);
+        FVector WorldPos = GetComponentTransform().TransformPosition((FVector)RenderMesh.GetVertex(i));
         HighResParticles[i].ID = i;
         HighResParticles[i].Position = WorldPos;
         HighResParticles[i].PrevPosition = WorldPos;
@@ -572,7 +572,7 @@ void UMySoftBodyMeshComponent::BuildClothState()
     {
         // 获取物理网格的顶点位置
         FVector3d LocalPos = PhysicsMesh->GetVertex(i); 
-        FVector WorldPos = GetComponentLocation() + (FVector)LocalPos;
+        FVector WorldPos = GetComponentTransform().TransformPosition((FVector)LocalPos);
 
         ProxyParticles[i].ID = i;
         ProxyParticles[i].Position = WorldPos;
@@ -1557,7 +1557,7 @@ void UMySoftBodyMeshComponent::TickUpdateCloth()
     // 获取底层 Mesh
     UE::Geometry::FDynamicMesh3* Mesh = &GetDynamicMesh()->GetMeshRef();
     if (Mesh->VertexCount() == 0) return;
-    FVector ComponentLoc = GetComponentLocation();
+    const FTransform InvTransform = GetComponentTransform().Inverse();
     if (!bUpdateViaGPU)
     {
         double StartTime = FPlatformTime::Seconds();
@@ -1565,7 +1565,7 @@ void UMySoftBodyMeshComponent::TickUpdateCloth()
         {
             ParallelFor(ProxyParticleCount, [&](int32 i)
             {
-                FVector LocalPos = ProxyParticles[i].Position - ComponentLoc;
+                FVector LocalPos = InvTransform.TransformPosition(ProxyParticles[i].Position);
                 Mesh->SetVertex(i, FVector3d(LocalPos), false); 
             });
         }
@@ -1574,7 +1574,7 @@ void UMySoftBodyMeshComponent::TickUpdateCloth()
             // 如果使用了代理（Proxy），则依然由蒙皮后的 HighResParticles 决定
             ParallelFor(HighResParticleCount, [&](int32 i)
             {
-                FVector LocalPos = HighResParticles[i].Position - ComponentLoc;
+                FVector LocalPos = InvTransform.TransformPosition(HighResParticles[i].Position);
                 Mesh->SetVertex(i, FVector3d(LocalPos), false); 
             });
         }
@@ -1662,7 +1662,7 @@ void UMySoftBodyMeshComponent::TickUpdateCloth()
             {
                 if (Mesh->IsVertex(Vid))
                 {
-                    FVector3f N = (FVector3f)CurrentNormals[Vid].GetSafeNormal();
+                    FVector3f N = (FVector3f)InvTransform.TransformVector(CurrentNormals[Vid]).GetSafeNormal();
                     for (int32 ElemID : CachedHighResNormalElements[Vid])
                     {
                         NormalOverlay->SetElement(ElemID, N);
@@ -1677,7 +1677,7 @@ void UMySoftBodyMeshComponent::TickUpdateCloth()
             {
                 if (Mesh->IsVertex(Vid))
                 {
-                    FVector3f N = (FVector3f)HighResCurrentNormals[Vid].GetSafeNormal();
+                    FVector3f N = (FVector3f)InvTransform.TransformVector(HighResCurrentNormals[Vid]).GetSafeNormal();
                     for (int32 ElemID : CachedHighResNormalElements[Vid])
                     {
                         NormalOverlay->SetElement(ElemID, N);
