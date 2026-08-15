@@ -1,0 +1,33 @@
+# =========================================================
+# Unreal Engine 5 项目 .gitignore
+# 规则：只版本化「源文件 + 资产 + 配置」，忽略一切引擎自动生成的临时文件
+# =========================================================
+
+# ---- IDE / 编辑器 ----
+.vs/
+.idea/
+.vscode/
+*.sln
+*.sln.DotSettings.user
+*.user
+.vsconfig
+
+# ---- UE 编译产物 / 缓存（体积巨大，绝不能进 git）----
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+# 插件内的编译产物同样忽略
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# ---- 其他临时文件 ----
+*.VC.db
+*.opensdf
+*.opendb
+*.sdf
+*.suo
+
+# ---- 保留：Source、Content、Config、Plugins/Source、Shaders、uplugin、ThirdParty ----

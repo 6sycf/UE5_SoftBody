@@ -1,0 +1,744 @@
+#include "/Engine/Public/Platform.ush"
+
+// =========================================================
+// 1. 数据结构定义
+// =========================================================
+
+struct FSoftBodyParticle
+{
+    float3 Position;
+    float3 PrevPosition;
+    float3 Velocity;
+    float InvMass;
+    int State; // 0 = Pinned, 1 = Active
+};
+
+struct FConstraint
+{
+    int P0;
+    int P1;
+    float RestLength;
+    float Stiffness;
+};
+
+struct FDihedralConstraint
+{
+    int P1;
+    int P2;
+    int P3;
+    int P4;
+    float RestAngle;
+    float Stiffness;
+};
+
+struct FNeighborInfo
+{
+    uint StartIndex;
+    uint Count;
+};
+
+struct FLambda { float Value; };
+
+// =========================================================
+// 2. 资源绑定
+// =========================================================
+
+RWStructuredBuffer<FSoftBodyParticle> RWParticles;
+StructuredBuffer<FSoftBodyParticle> Particles;
+StructuredBuffer<FConstraint> Constraints;
+RWStructuredBuffer<FLambda> LambdaBuffer;
+
+StructuredBuffer<float3> WeightedNormalsRead;
+// 邻接表
+StructuredBuffer<FNeighborInfo> ParticleConInfos;
+StructuredBuffer<uint> AdjacencyIndices;
+// 二面角
+StructuredBuffer<FDihedralConstraint> DihedralConstraints;
+RWStructuredBuffer<FLambda> DihedralLambdaBuffer;
+StructuredBuffer<FNeighborInfo> DihedralConInfos;  // 二面角的邻接表起点和数量
+StructuredBuffer<uint> DihedralAdjacencyIndices;   // 二面角的邻接表索引
+
+// Uniforms
+float SubstepTime;
+uint ParticleCount;
+uint ConstraintCount;
+float Omega; // 松弛因子
+
+// 棍子碰撞
+float3 StickStart;
+float3 StickEnd;
+float StickRadius;
+float ParticleRadius;
+int HasStickInput;
+
+// 环境碰撞
+float GroundFriction;
+float GroundRestitution;
+
+float HighResStiffness;
+float HighResDamping;
+// =========================================================
+// Kernel 1: 积分
+// =========================================================
+[numthreads(64, 1, 1)]
+void IntegrateCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return;
+
+    float3 Gravity = float3(0, 0, -980.0);
+    P.Velocity += Gravity * SubstepTime;
+    
+    // 阻尼（与CPU版本一致）
+    P.Velocity *= 0.998f;
+    
+    P.PrevPosition = P.Position;
+    P.Position += P.Velocity * SubstepTime;
+
+    RWParticles[idx] = P;
+}
+
+// =========================================================
+// Kernel 2: 距离约束求解 (Jacobi)
+// =========================================================
+StructuredBuffer<float3> TargetPositions;
+float AttachmentStiffness;
+int UseTargetPosition;
+[numthreads(64, 1, 1)]
+void SolveAndApplyCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint myIdx = DTid.x;
+    if (myIdx >= ParticleCount) return;
+
+    FSoftBodyParticle Me = RWParticles[myIdx];
+    if (Me.State == 0) return;
+
+    FNeighborInfo Info = ParticleConInfos[myIdx];
+    if (Info.Count == 0) return;
+
+    float3 SumDelta = float3(0, 0, 0);
+    for (uint k = 0; k < Info.Count; k++)
+    {
+        int constraintIdx = AdjacencyIndices[Info.StartIndex + k];
+        FConstraint C = Constraints[constraintIdx];
+        int neighborIdx = (C.P0 == (int)myIdx) ? C.P1 : C.P0;
+
+        FSoftBodyParticle Neighbor = RWParticles[neighborIdx];
+
+        float wSum = Me.InvMass + Neighbor.InvMass;
+        if (wSum > 1e-6)
+        {
+            float3 Dir = Me.Position - Neighbor.Position;
+            float Len = length(Dir);
+            if (Len > 1e-6)
+            {
+                float Alpha = 1.0f / (C.Stiffness * SubstepTime * SubstepTime);
+                float3 n = Dir / Len;
+                float C_val = Len - C.RestLength;
+
+                float PrevLambda = LambdaBuffer[constraintIdx].Value;
+                float DeltaLambda = (-C_val - Alpha * PrevLambda) / (wSum + Alpha);
+
+                SumDelta += n * DeltaLambda * Me.InvMass;
+            }
+        }
+    }
+    
+    float3 FinalDelta = SumDelta;
+    uint totalConstraints = Info.Count;
+
+    // 如果启用了目标牵引 (只有高模会设为 1)
+    if (UseTargetPosition == 1)
+    {
+        float3 targetPos = TargetPositions[myIdx];
+        float3 pullDir = targetPos - Me.Position;
+        float dist = length(pullDir);
+        
+        // 像一根隐形的弹簧一样拉扯它
+        if (dist > 1e-6f)
+        {
+            FinalDelta += pullDir * saturate(AttachmentStiffness);
+            totalConstraints += 1;
+        }
+    }
+    FinalDelta = (FinalDelta / max((float)totalConstraints, 1.0f)) * Omega;
+    RWParticles[myIdx].Position += FinalDelta;
+}
+
+// =========================================================
+// Kernel: 求解二面角弯曲约束 (Jacobi 迭代)
+// =========================================================
+[numthreads(64, 1, 1)]
+void SolveDihedralCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint myIdx = DTid.x;
+    if (myIdx >= ParticleCount) return;
+
+    FSoftBodyParticle Me = RWParticles[myIdx];
+    if (Me.State == 0) return; // 固定点不移动
+
+    FNeighborInfo Info = DihedralConInfos[myIdx];
+    if (Info.Count == 0) return;
+
+    float3 SumDelta = float3(0, 0, 0);
+    
+    for (uint k = 0; k < Info.Count; k++)
+    {
+        uint constraintIdx = DihedralAdjacencyIndices[Info.StartIndex + k];
+        FDihedralConstraint C = DihedralConstraints[constraintIdx];
+
+        FSoftBodyParticle P1 = RWParticles[C.P1];
+        FSoftBodyParticle P2 = RWParticles[C.P2];
+        FSoftBodyParticle P3 = RWParticles[C.P3];
+        FSoftBodyParticle P4 = RWParticles[C.P4];
+
+        float3 e = P2.Position - P1.Position;
+        float eLenSq = dot(e, e);
+        float eLen = sqrt(eLenSq);
+        
+        if (eLen < 1e-6f) continue;
+
+        // 1. 计算未归一化法线
+        float3 n1 = cross(P2.Position - P1.Position, P3.Position - P1.Position);
+        float3 n2 = cross(P1.Position - P2.Position, P4.Position - P2.Position);
+
+        float n1LenSq = dot(n1, n1);
+        float n2LenSq = dot(n2, n2);
+
+        if (n1LenSq < 1e-6f || n2LenSq < 1e-6f) continue;
+
+        // 直接使用未归一化的法线计算 x 和 y
+        float dot_unnorm = dot(n1, n2); 
+        
+        // 混合积: dot(e, cross(n1,n2))，只需要除以 eLen 消除共享边长度带来的影响
+        float det_unnorm = dot(e, cross(n1, n2)) / eLen; 
+        
+        // atan2 内部会自动抵消掉共同的缩放因子 (|n1|*|n2|)
+        float currentAngle = atan2(det_unnorm, dot_unnorm);
+
+        // 3. 计算 4 个顶点的梯度 (直接使用 n1LenSq, n2LenSq，完全没有 sqrt)
+        float3 grad3 = -(eLen / n1LenSq) * n1;
+        float3 grad4 = -(eLen / n2LenSq) * n2;
+        float3 grad1 = -dot(P2.Position - P3.Position, e) / eLenSq * grad3 - dot(P2.Position - P4.Position, e) / eLenSq * grad4;
+        float3 grad2 = -dot(P3.Position - P1.Position, e) / eLenSq * grad3 - dot(P4.Position - P1.Position, e) / eLenSq * grad4;
+
+        // 4. 计算分母的质量加权梯度平方和
+        float wSumGradSq = P1.InvMass * dot(grad1, grad1) + 
+                           P2.InvMass * dot(grad2, grad2) + 
+                           P3.InvMass * dot(grad3, grad3) + 
+                           P4.InvMass * dot(grad4, grad4);
+
+        if (wSumGradSq < 1e-6f) continue;
+
+        // 5. XPBD 柔度与 Lambda 计算
+        float alpha = 1.0f / (C.Stiffness * SubstepTime * SubstepTime);
+        float C_val = currentAngle - C.RestAngle;
+        float PrevLambda = DihedralLambdaBuffer[constraintIdx].Value;
+        
+        float dLambda = (-C_val - alpha * PrevLambda) / (wSumGradSq + alpha);
+
+        // 6. 提取属于当前线程顶点的梯度
+        float3 myGrad = float3(0, 0, 0);
+        if (myIdx == (uint)C.P1) myGrad = grad1;
+        else if (myIdx == (uint)C.P2) myGrad = grad2;
+        else if (myIdx == (uint)C.P3) myGrad = grad3;
+        else if (myIdx == (uint)C.P4) myGrad = grad4;
+
+        // 7. 累加位移
+        SumDelta += Me.InvMass * myGrad * dLambda;
+    }
+
+    // 8. 取平均值并乘以松弛因子 Omega，防止过冲
+    RWParticles[myIdx].Position += (SumDelta / max((float)Info.Count, 1.0f)) * Omega;
+}
+// =========================================================
+// Kernel: 更新二面角 XPBD 乘子 (Lambda)
+// =========================================================
+[numthreads(64, 1, 1)]
+void UpdateDihedralLambdasCS(uint3 DTid : SV_DispatchThreadID)
+{
+    // 注意：这里的线程 ID 对应的是约束的索引，而不是粒子
+    uint cIdx = DTid.x;
+    if (cIdx >= ConstraintCount) return;
+
+    FDihedralConstraint C = DihedralConstraints[cIdx];
+
+    // 获取当前（已经被本轮 Jacobi 移动过）的粒子位置
+    FSoftBodyParticle P1 = RWParticles[C.P1];
+    FSoftBodyParticle P2 = RWParticles[C.P2];
+    FSoftBodyParticle P3 = RWParticles[C.P3];
+    FSoftBodyParticle P4 = RWParticles[C.P4];
+
+    float3 e = P2.Position - P1.Position;
+    float eLenSq = dot(e, e);
+    
+    if (eLenSq < 1e-6f) return;
+    float eLen = sqrt(eLenSq); // 算共享边长度
+
+    // 1. 计算未归一化法线
+    float3 n1 = cross(P2.Position - P1.Position, P3.Position - P1.Position);
+    float3 n2 = cross(P1.Position - P2.Position, P4.Position - P2.Position);
+
+    float n1LenSq = dot(n1, n1);
+    float n2LenSq = dot(n2, n2);
+
+    if (n1LenSq < 1e-6f || n2LenSq < 1e-6f) return;
+
+    // 2. 无 sqrt 优化版角度计算
+    float dot_unnorm = dot(n1, n2); 
+    float det_unnorm = dot(e, cross(n1, n2)) / eLen; 
+    float currentAngle = atan2(det_unnorm, dot_unnorm);
+
+    // 3. 计算 4 个顶点的梯度
+    float3 grad3 = (eLen / n1LenSq) * n1;
+    float3 grad4 = (eLen / n2LenSq) * n2;
+    float3 grad1 = -dot(P2.Position - P3.Position, e) / eLenSq * grad3 - dot(P2.Position - P4.Position, e) / eLenSq * grad4;
+    float3 grad2 = -dot(P3.Position - P1.Position, e) / eLenSq * grad3 - dot(P4.Position - P1.Position, e) / eLenSq * grad4;
+
+    float wSumGradSq = P1.InvMass * dot(grad1, grad1) + 
+                       P2.InvMass * dot(grad2, grad2) + 
+                       P3.InvMass * dot(grad3, grad3) + 
+                       P4.InvMass * dot(grad4, grad4);
+
+    if (wSumGradSq < 1e-6f) return;
+
+    // 4. 计算 XPBD 乘子增量
+    float alpha = 1.0f / (C.Stiffness * SubstepTime * SubstepTime);
+    float C_val = currentAngle - C.RestAngle;
+    float PrevLambda = DihedralLambdaBuffer[cIdx].Value;
+    
+    float dLambda = (-C_val - alpha * PrevLambda) / (wSumGradSq + alpha);
+    
+    // 5. 将增量累加回 Buffer
+    DihedralLambdaBuffer[cIdx].Value += dLambda;
+}
+// =========================================================
+// Kernel 3: 更新 Lambda
+// =========================================================
+[numthreads(256, 1, 1)]
+void UpdateLambdasCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint cIdx = DTid.x;
+    if (cIdx >= ConstraintCount) return;
+
+    FConstraint C = Constraints[cIdx];
+    FSoftBodyParticle P0 = RWParticles[C.P0];
+    FSoftBodyParticle P1 = RWParticles[C.P1];
+
+    float wSum = P0.InvMass + P1.InvMass;
+    if (wSum < 1e-6) return;
+
+    float3 Dir = P0.Position - P1.Position;
+    float Len = length(Dir);
+    if (Len <= 1e-6) return;
+
+    float C_val = Len - C.RestLength;
+    float Alpha = 1.0f / (C.Stiffness * SubstepTime * SubstepTime);
+    float PrevLambda = LambdaBuffer[cIdx].Value;
+    float DeltaLambda = (-C_val - Alpha * PrevLambda) / (wSum + Alpha);
+
+    LambdaBuffer[cIdx].Value = PrevLambda + DeltaLambda;
+}
+
+// =========================================================
+// Kernel 4: 棍子碰撞
+// =========================================================
+[numthreads(64, 1, 1)]
+void CollideStickCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+    if (HasStickInput == 0) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return;
+
+    float3 stickVec = StickEnd - StickStart;
+    float stickLenSq = dot(stickVec, stickVec);
+
+    float t = 0.0f;
+    if (stickLenSq > 1e-6f)
+        t = saturate(dot(P.Position - StickStart, stickVec) / stickLenSq);
+
+    float3 closestPt = StickStart + stickVec * t;
+    float3 toParticle = P.Position - closestPt;
+    float dist = length(toParticle);
+    float minDist = StickRadius + ParticleRadius;
+
+    if (dist < minDist && dist > 1e-6f)
+    {
+        float3 normal = toParticle / dist;
+        RWParticles[idx].Position += normal * (minDist - dist);
+    }
+}
+
+// =========================================================
+// Kernel 5: 更新速度
+// =========================================================
+[numthreads(64, 1, 1)]
+void UpdateVelocityCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State != 0)
+    {
+        P.Velocity = (P.Position - P.PrevPosition) / SubstepTime;
+        P.Velocity *= 0.998f;
+    }
+    RWParticles[idx] = P;
+}
+
+// =========================================================
+// Kernel 6: 清零 Lambda (每帧开始时调用)
+// =========================================================
+[numthreads(256, 1, 1)]
+void ClearLambdasCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint cIdx = DTid.x;
+    if (cIdx >= ConstraintCount) return;
+    LambdaBuffer[cIdx].Value = 0.0f;
+}
+// =========================================================
+// Kernel 7: 导出位置 
+// =========================================================
+StructuredBuffer<FSoftBodyParticle> ReadParticles;  // 添加只读 Buffer
+RWStructuredBuffer<float3> OutputPositions;
+
+[numthreads(64, 1, 1)]
+void ExportPositionsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+    OutputPositions[idx] = ReadParticles[idx].Position;  // 使用 ReadParticles
+}
+
+// =========================================================
+// 体积约束相关
+// =========================================================
+
+struct FTriangle { int A; int B; int C; };
+
+StructuredBuffer<FTriangle> Triangles;
+RWStructuredBuffer<float3> WeightedNormals;
+RWStructuredBuffer<int> VolumeInt;           // [0] = 累加体积
+StructuredBuffer<int> VolumeIntRead;
+StructuredBuffer<uint> VertexTriangleOffsets;
+StructuredBuffer<uint> VertexTriangleCounts;
+StructuredBuffer<uint> VertexTriangleIndices;
+
+uint TriangleCount;
+float RestVolume;
+float VolumePressureCoeff;
+
+// Kernel 8: 清零法线
+[numthreads(64, 1, 1)]
+void ClearNormalsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+    WeightedNormals[idx]=float3(0, 0, 1);
+}
+
+// Kernel 9: 计算加权法线
+[numthreads(64, 1, 1)]
+void ComputeWeightedNormalsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint vertexIdx = DTid.x;
+    if (vertexIdx >= ParticleCount) return;
+
+    float3 sumNormal = float3(0, 0, 0);
+    
+    uint start = VertexTriangleOffsets[vertexIdx];
+    uint count = VertexTriangleCounts[vertexIdx];
+
+    for (uint i = 0; i < count; i++)
+    {
+        uint triIdx = VertexTriangleIndices[start + i];
+        FTriangle tri = Triangles[triIdx];
+        
+        float3 P0 = Particles[tri.A].Position;
+        float3 P1 = Particles[tri.B].Position;
+        float3 P2 = Particles[tri.C].Position;
+        sumNormal += cross(P2 - P0, P1 - P0);
+    }
+    
+    WeightedNormals[vertexIdx] = sumNormal;
+}
+
+// Kernel 10: 计算体积
+[numthreads(64, 1, 1)]
+void ComputeVolumeCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    float3 pos = Particles[idx].Position;
+    float3 normal = WeightedNormalsRead[idx];
+    int contribution = int(dot(pos, normal) * 1.0f);
+    InterlockedAdd(VolumeInt[0], contribution);
+}
+
+// Kernel 11: 应用体积压力
+[numthreads(64, 1, 1)]
+void ApplyVolumePressureCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return;
+
+    float curVolume = float(VolumeIntRead[0]) / 6.0f;
+    float volumeRatio = (RestVolume - curVolume) / (RestVolume + 1.0f);
+    if (volumeRatio < 0) volumeRatio *= 0.1f;
+    float pressureMag = clamp(volumeRatio * VolumePressureCoeff, -5000.0f, 5000.0f);
+    float3 normal = WeightedNormalsRead[idx];
+    P.Velocity += normal * pressureMag * P.InvMass * SubstepTime;
+    
+    float3 pressureOffset = normal * pressureMag * P.InvMass * SubstepTime * SubstepTime;
+    P.Position += pressureOffset;
+    
+    RWParticles[idx] = P;
+}
+
+// Kernel 12: 清零体积
+[numthreads(1, 1, 1)]
+void ClearVolumeCS(uint3 DTid : SV_DispatchThreadID) { VolumeInt[0] = 0; }
+
+// =========================================================
+// Kernel 13: 地面碰撞 (终极防滑版)
+// =========================================================
+float GroundZ;
+
+[numthreads(64, 1, 1)]
+void CollideGroundCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return; // 固定点不处理
+
+    float GroundZ = 0.0f; // 假设地面高度为 0
+
+    // 检查是否发生穿透
+    if (P.Position.z < GroundZ)
+    {
+        // 1. 计算穿透深度
+        float PenetrationDepth = GroundZ - P.Position.z;
+        
+        // 2. 纵向硬碰撞：强行拉回地面
+        P.Position.z = GroundZ;
+
+        // 3. 【修复抽搐核心 1】：基于位置的摩擦力 (Position-Based Friction)
+        // 计算这一步在 X-Y 平面上的滑动向量
+        float2 TangentDelta = float2(P.Position.x - P.PrevPosition.x, P.Position.y - P.PrevPosition.y);
+        float SlideDist = length(TangentDelta);
+
+        if (SlideDist > 1e-6f)
+        {
+            float FrictionCoef = 0.5f; // 摩擦系数 (0 = 无摩擦，越大越像橡胶)
+            
+            // 库仑摩擦力法则：摩擦距离不应超过穿透深度乘以摩擦系数
+            float FrictionDrop = min(PenetrationDepth * FrictionCoef, SlideDist);
+            
+            // 将粒子向 PrevPosition 的方向拉回，模拟摩擦阻力
+            float2 FrictionOffset = (TangentDelta / SlideDist) * FrictionDrop;
+            P.Position.x -= FrictionOffset.x;
+            P.Position.y -= FrictionOffset.y;
+        }
+
+        // 4. 【修复抽搐核心 2】：修改 PrevPosition 强行抹除向下的速度
+        // 在 XPBD 中，强行把 PrevPosition.z 设为和 Position.z 一样，
+        // 就能确保在后续算速度 (P - P_prev)/dt 时，向下的垂直速度变为 0，防止下一帧发生微穿透。
+        // 可选：加入反弹系数 Restitution
+        float Restitution = 0.0f; // 软体砸在地上通常不反弹，设为 0
+        if (P.PrevPosition.z > GroundZ)
+        {
+            float ApproachSpeed = P.PrevPosition.z - GroundZ;
+            P.PrevPosition.z = P.Position.z + ApproachSpeed * Restitution;
+        }
+        else
+        {
+            P.PrevPosition.z = P.Position.z;
+        }
+    }
+
+    RWParticles[idx] = P;
+}
+
+// =========================================================
+// Kernel 14: 导出归一化法线 (用于 Readback)
+// =========================================================
+
+RWStructuredBuffer<float3> OutputNormals;
+
+[numthreads(64, 1, 1)]
+void ExportNormalsCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+    float3 normal = WeightedNormalsRead[idx];
+    float len = length(normal);
+    if (len > 1e-6f)
+        normal /= len;  // 归一化
+    else
+        normal = float3(0, 0, 1);  // 默认向上
+    
+    OutputNormals[idx] = normal;
+}
+
+// =========================================================
+// Kernel 15: 导出体积数据 (用于调试)
+// =========================================================
+
+RWStructuredBuffer<int> OutputVolume;
+
+[numthreads(1, 1, 1)]
+void ExportVolumeCS(uint3 DTid : SV_DispatchThreadID)
+{
+    OutputVolume[0] = VolumeIntRead[0];  // 使用 SRV 读取
+}
+// =========================================================
+// Kernel 16:基于重心坐标与法线偏移的高模更新
+// =========================================================
+struct FScaffoldBinding
+{
+    int ProxyTriIndex;
+    float3 Barycentric;
+    float NormalOffset;
+};
+
+// 【核心修改 1】：数据类型从 float3 改为 FSoftBodyParticle，完美匹配 C++ 传进来的真实粒子 Buffer
+RWStructuredBuffer<FSoftBodyParticle> RWTargetPositions; 
+StructuredBuffer<FSoftBodyParticle> ReadProxyParticles;
+StructuredBuffer<FScaffoldBinding> ScaffoldBindings;
+StructuredBuffer<FTriangle> ProxyTriangles;
+uint HighResCount;
+
+[numthreads(64, 1, 1)]
+void UpdateHighResTargetCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= HighResCount) return;
+
+    // 1. 获取当前高模顶点的绑定信息
+    FScaffoldBinding Binding = ScaffoldBindings[idx];
+    
+    // 容错：如果在 CPU 端没找到对应三角形 (ProxyTriIndex 为 -1)，直接返回
+    if (Binding.ProxyTriIndex < 0) 
+    {
+        return; 
+    }
+
+    // 2. 获取低模宿主三角形的拓扑索引
+    FTriangle Tri = ProxyTriangles[Binding.ProxyTriIndex];
+
+    // 3. 读取低模三角形三个顶点的当前位置
+    float3 A = ReadProxyParticles[Tri.A].Position;
+    float3 B = ReadProxyParticles[Tri.B].Position;
+    float3 C = ReadProxyParticles[Tri.C].Position;
+
+    // 4. 读取重心坐标 (u, v, w)
+    float u = Binding.Barycentric.x;
+    float v = Binding.Barycentric.y;
+    float w = Binding.Barycentric.z;
+
+    // 5. 插值算出投影点在当前帧的基础位置
+    float3 BasePos = u * A + v * B + w * C;
+
+    // 6. 实时计算当前变形后的三角形法线
+    float3 Edge1 = B - A;
+    float3 Edge2 = C - A;
+    float3 Normal = cross(Edge1, Edge2);
+    float AreaX2 = length(Normal);
+
+    if (AreaX2 > 1e-8f)
+    {
+        Normal /= AreaX2;
+    }
+    else
+    {
+        Normal = float3(0, 0, 1);
+    }
+
+    // 7. 沿着新法线方向，推算出原本的高度偏移
+    float3 P_target = BasePos + Normal * Binding.NormalOffset;
+    
+    FSoftBodyParticle P = RWTargetPositions[idx];
+    
+    // 如果是编辑器里刷的固定点，直接死死绑住，不参与动态
+    if (P.State == 0) 
+    {
+        P.PrevPosition = P.Position;
+        P.Position = P_target;
+        P.Velocity = float3(0, 0, 0);
+        RWTargetPositions[idx] = P;
+        return;
+    }
+
+    // -----------------------------------------------------------
+    // 标准形状匹配更新 (Standard Shape Matching Integration)
+    // 方程: V_new = V_old + alpha * (Delta X / dt)
+    // -----------------------------------------------------------
+    
+    // 1. 记录上一帧位置（用于外部系统可能的差分，保持数据结构完整）
+    P.PrevPosition = P.Position;
+
+    // 2. 计算位移差 (Delta X)
+    float3 DeltaX = P_target - P.Position;
+
+    // 3. 速度衰减 (保留原有的空气阻力，防止无休止震荡)
+    P.Velocity *= HighResDamping;
+
+    // 4. [核心方程] 计算速度修正量并累加
+    // saturate(HighResStiffness) 对应公式中的 alpha
+    P.Velocity += saturate(HighResStiffness) * (DeltaX / SubstepTime);
+
+    // 5. 显式积分更新位置 (X_new = X_old + V_new * dt)
+    P.Position += P.Velocity * SubstepTime;
+
+    // 8. 真正写回 GPU 显存
+    RWTargetPositions[idx] = P;
+}
+// =========================================================
+// Kernel 17: 导出高模数据到实时纹理 (VAT)
+// =========================================================
+StructuredBuffer<FSoftBodyParticle> HighResParticles;
+StructuredBuffer<float3> HighResNormals;
+StructuredBuffer<float3> HighResRestPositions;
+// 声明可读写的 2D 纹理
+RWTexture2D<float4> OutPositionTex;
+RWTexture2D<float4> OutNormalTex;
+
+uint VertexCount;
+uint TexDimension;
+
+[numthreads(64, 1, 1)]
+void ExportToTextureCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= VertexCount) return;
+
+    // 核心数学：将 1D 顶点索引转换为 2D 纹理坐标 (Pixel Coord)
+    // 假设纹理宽度 (TexDimension) 是 100
+    // 索引 150 -> x = 50, y = 1
+    uint x = idx % TexDimension;
+    uint y = idx / TexDimension;
+    uint2 PixelCoord = uint2(x, y);
+    float3 CurrentPos = HighResParticles[idx].Position;
+    float3 RestPos = HighResRestPositions[idx];
+    // 读取高模数据
+    float3 Offset = CurrentPos - RestPos;
+    float3 Norm = HighResNormals[idx];
+    Norm=normalize(Norm);
+    
+    // 写入纹理像素 (Alpha 通道闲置，可以填 1.0 和 0.0)
+    OutPositionTex[PixelCoord] = float4(Offset, 1.0f);
+    OutNormalTex[PixelCoord] = float4(Norm * 0.5f + 0.5f, 0.0f);
+}
