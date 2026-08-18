@@ -2,6 +2,7 @@
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 #include "RenderGraphResources.h"
+#include "GlobalDistanceFieldConstants.h"
 
 // =========================================================
 // GPU 数据结构 (与 Shader 匹配)
@@ -281,26 +282,6 @@ public:
 };
 
 // =========================================================
-// Kernel 13: CollideGroundCS (地面碰撞)
-// =========================================================
-class SOFTBODYGPU_API FCollideGroundCS : public FSoftBodyShaderBase
-{
-public:
-    DECLARE_GLOBAL_SHADER(FCollideGroundCS);
-    SHADER_USE_PARAMETER_STRUCT(FCollideGroundCS, FSoftBodyShaderBase);
-    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FGPUParticle>, RWParticles)
-        SHADER_PARAMETER(uint32, ParticleCount)
-        SHADER_PARAMETER(float, GroundZ)
-        SHADER_PARAMETER(float, ParticleRadius)
-        SHADER_PARAMETER(float, GroundFriction)
-        SHADER_PARAMETER(float, GroundRestitution)
-        SHADER_PARAMETER(float, SubstepTime)
-    END_SHADER_PARAMETER_STRUCT()
-};
-
-
-// =========================================================
 // Kernel 14: ExportNormalsCS (导出归一化法线)
 // =========================================================
 
@@ -410,5 +391,34 @@ public:
         // 控制参数
         SHADER_PARAMETER(uint32, VertexCount)
         SHADER_PARAMETER(uint32, TexDimension)
+    END_SHADER_PARAMETER_STRUCT()
+};
+
+// =========================================================
+// Kernel 18: 全局距离场碰撞 (GDF)
+// 采样 UE 全局距离场 (Page Atlas 稀疏 clipmap)，把穿透粒子推出表面。
+// =========================================================
+class SOFTBODYGPU_API FCollideGDFCS : public FSoftBodyShaderBase
+{
+public:
+    DECLARE_GLOBAL_SHADER(FCollideGDFCS);
+    SHADER_USE_PARAMETER_STRUCT(FCollideGDFCS, FSoftBodyShaderBase);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FGPUParticle>, RWParticles)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture3D, GDFPageAtlasTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture3D<uint>, GDFPageTableTexture)
+        SHADER_PARAMETER_SAMPLER(SamplerState, GDFPageAtlasSampler)
+        SHADER_PARAMETER_ARRAY(FVector4f, GDFTranslatedCenterAndExtent, [GlobalDistanceField::MaxClipmaps])
+        SHADER_PARAMETER_ARRAY(FVector4f, GDFTranslatedWorldToUVAddAndMul, [GlobalDistanceField::MaxClipmaps])
+        SHADER_PARAMETER(FVector3f, GDFInvPageAtlasSize)
+        SHADER_PARAMETER(uint32, GDFClipmapSizeInPages)
+        SHADER_PARAMETER(float, GDFVolumeTexelSize)
+        SHADER_PARAMETER(uint32, NumGDFClipmaps)
+        SHADER_PARAMETER(uint32, ParticleCount)
+        SHADER_PARAMETER(float, ParticleRadius)
+        SHADER_PARAMETER(FVector3f, PreViewTranslation)
+        SHADER_PARAMETER(float, SubstepTime)
+        SHADER_PARAMETER(float, GDFFriction)
     END_SHADER_PARAMETER_STRUCT()
 };

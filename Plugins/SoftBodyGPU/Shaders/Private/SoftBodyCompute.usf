@@ -71,10 +71,6 @@ float StickRadius;
 float ParticleRadius;
 int HasStickInput;
 
-// 环境碰撞
-float GroundFriction;
-float GroundRestitution;
-
 float HighResStiffness;
 float HighResDamping;
 // =========================================================
@@ -511,68 +507,6 @@ void ApplyVolumePressureCS(uint3 DTid : SV_DispatchThreadID)
 void ClearVolumeCS(uint3 DTid : SV_DispatchThreadID) { VolumeInt[0] = 0; }
 
 // =========================================================
-// Kernel 13: 地面碰撞 (终极防滑版)
-// =========================================================
-float GroundZ;
-
-[numthreads(64, 1, 1)]
-void CollideGroundCS(uint3 DTid : SV_DispatchThreadID)
-{
-    uint idx = DTid.x;
-    if (idx >= ParticleCount) return;
-
-    FSoftBodyParticle P = RWParticles[idx];
-    if (P.State == 0) return; // 固定点不处理
-
-    float GroundZ = 0.0f; // 假设地面高度为 0
-
-    // 检查是否发生穿透
-    if (P.Position.z < GroundZ)
-    {
-        // 1. 计算穿透深度
-        float PenetrationDepth = GroundZ - P.Position.z;
-        
-        // 2. 纵向硬碰撞：强行拉回地面
-        P.Position.z = GroundZ;
-
-        // 3. 【修复抽搐核心 1】：基于位置的摩擦力 (Position-Based Friction)
-        // 计算这一步在 X-Y 平面上的滑动向量
-        float2 TangentDelta = float2(P.Position.x - P.PrevPosition.x, P.Position.y - P.PrevPosition.y);
-        float SlideDist = length(TangentDelta);
-
-        if (SlideDist > 1e-6f)
-        {
-            float FrictionCoef = 0.5f; // 摩擦系数 (0 = 无摩擦，越大越像橡胶)
-            
-            // 库仑摩擦力法则：摩擦距离不应超过穿透深度乘以摩擦系数
-            float FrictionDrop = min(PenetrationDepth * FrictionCoef, SlideDist);
-            
-            // 将粒子向 PrevPosition 的方向拉回，模拟摩擦阻力
-            float2 FrictionOffset = (TangentDelta / SlideDist) * FrictionDrop;
-            P.Position.x -= FrictionOffset.x;
-            P.Position.y -= FrictionOffset.y;
-        }
-
-        // 4. 【修复抽搐核心 2】：修改 PrevPosition 强行抹除向下的速度
-        // 在 XPBD 中，强行把 PrevPosition.z 设为和 Position.z 一样，
-        // 就能确保在后续算速度 (P - P_prev)/dt 时，向下的垂直速度变为 0，防止下一帧发生微穿透。
-        // 可选：加入反弹系数 Restitution
-        float Restitution = 0.0f; // 软体砸在地上通常不反弹，设为 0
-        if (P.PrevPosition.z > GroundZ)
-        {
-            float ApproachSpeed = P.PrevPosition.z - GroundZ;
-            P.PrevPosition.z = P.Position.z + ApproachSpeed * Restitution;
-        }
-        else
-        {
-            P.PrevPosition.z = P.Position.z;
-        }
-    }
-
-    RWParticles[idx] = P;
-}
-
-// =========================================================
 // Kernel 14: 导出归一化法线 (用于 Readback)
 // =========================================================
 
@@ -741,4 +675,172 @@ void ExportToTextureCS(uint3 DTid : SV_DispatchThreadID)
     // 写入纹理像素 (Alpha 通道闲置，可以填 1.0 和 0.0)
     OutPositionTex[PixelCoord] = float4(Offset, 1.0f);
     OutNormalTex[PixelCoord] = float4(Norm * 0.5f + 0.5f, 0.0f);
+}
+
+// =========================================================
+// 全局距离场 (GDF) 碰撞
+// 自包含实现，参考 Engine/Shaders/Private/DistanceField/GlobalDistanceFieldShared.ush
+// 采样 UE Page Atlas 稀疏 clipmap，把穿透静态网格体的粒子推出表面。
+// =========================================================
+
+#define MAX_GDF_CLIPMAPS 6
+#define GDF_PAGE_RESOLUTION_IN_ATLAS 8
+#define GDF_PAGE_RESOLUTION 7
+#define GDF_INFLUENCE_RANGE_IN_VOXELS 4
+#define GDF_INVALID_PAGE_ID 0xFFFFFFFFu
+
+Texture3D GDFPageAtlasTexture;
+Texture3D<uint> GDFPageTableTexture;
+SamplerState GDFPageAtlasSampler;
+
+float4 GDFTranslatedCenterAndExtent[MAX_GDF_CLIPMAPS];
+float4 GDFTranslatedWorldToUVAddAndMul[MAX_GDF_CLIPMAPS];
+float3 GDFInvPageAtlasSize;
+uint GDFClipmapSizeInPages;
+float GDFVolumeTexelSize;
+uint NumGDFClipmaps;
+float3 PreViewTranslation;
+float GDFFriction;
+
+struct FGDFPage
+{
+    uint PageIndex;
+    bool bValid;
+    bool bCoverage;
+};
+
+uint3 GDFPageLinearIndexToPageAtlasOffset(FGDFPage Page)
+{
+    uint3 Off;
+    Off.x = Page.PageIndex & 0x7F;
+    Off.y = (Page.PageIndex >> 7) & 0x7F;
+    Off.z = Page.PageIndex >> 14;
+    return Off;
+}
+
+FGDFPage UnpackGDFPage(uint Packed)
+{
+    FGDFPage Page;
+    Page.PageIndex = Packed & 0x00FFFFFF;
+    Page.bCoverage = (Packed & 0x80000000) != 0;
+    Page.bValid = Packed < GDF_INVALID_PAGE_ID;
+    return Page;
+}
+
+FGDFPage GetGDFPage(float3 VolumeUV, uint ClipmapIndex)
+{
+    int4 Coord = int4(saturate(VolumeUV) * GDFClipmapSizeInPages + int3(0, 0, ClipmapIndex * GDFClipmapSizeInPages), 0);
+    uint Packed = GDFPageTableTexture.Load(Coord).x;
+    return UnpackGDFPage(Packed);
+}
+
+float3 ComputeGDFPageUV(float3 VolumeUV, FGDFPage Page)
+{
+    uint3 AtlasOffset = GDFPageLinearIndexToPageAtlasOffset(Page);
+    float3 VolumePageUV = frac(VolumeUV * GDFClipmapSizeInPages);
+    float3 AtlasCoord = AtlasOffset * GDF_PAGE_RESOLUTION_IN_ATLAS + VolumePageUV * GDF_PAGE_RESOLUTION + 0.5f;
+    return AtlasCoord * GDFInvPageAtlasSize;
+}
+
+float3 ComputeGDFUV(float3 TranslatedWorldPos, uint ClipmapIndex)
+{
+    float4 AddAndMul = GDFTranslatedWorldToUVAddAndMul[ClipmapIndex];
+    float3 UV = frac(TranslatedWorldPos * AddAndMul.www + AddAndMul.xyz);
+    UV = frac(UV);
+    return UV;
+}
+
+float DecodeGDFDistance(float Encoded, float InfluenceRange)
+{
+    return (Encoded * 2.0f - 1.0f) * InfluenceRange;
+}
+
+float GDFDistanceFromBoxToPointInside(float3 BoxCenter, float3 BoxExtent, float3 Point)
+{
+    float3 DistancesToMin = max(Point - BoxCenter + BoxExtent, 0);
+    float3 DistancesToMax = max(BoxCenter + BoxExtent - Point, 0);
+    float3 Closest = min(DistancesToMin, DistancesToMax);
+    return min(Closest.x, min(Closest.y, Closest.z));
+}
+
+float SampleGDFDistance(float3 TranslatedWorldPos)
+{
+    float Distance = 0.0f;
+    for (uint ClipmapIndex = 0; ClipmapIndex < NumGDFClipmaps; ClipmapIndex++)
+    {
+        float3 Center = GDFTranslatedCenterAndExtent[ClipmapIndex].xyz;
+        float3 Extent = GDFTranslatedCenterAndExtent[ClipmapIndex].www;
+        float ClipmapVoxelExtent = GDFTranslatedCenterAndExtent[ClipmapIndex].w * GDFVolumeTexelSize;
+        float InfluenceRange = 2.0f * GDF_INFLUENCE_RANGE_IN_VOXELS * ClipmapVoxelExtent;
+
+        Distance = InfluenceRange;
+        if (GDFDistanceFromBoxToPointInside(Center, Extent, TranslatedWorldPos) > ClipmapVoxelExtent)
+        {
+            float3 VolumeUV = ComputeGDFUV(TranslatedWorldPos, ClipmapIndex);
+            FGDFPage Page = GetGDFPage(VolumeUV, ClipmapIndex);
+            if (Page.bValid)
+            {
+                float3 PageUV = ComputeGDFPageUV(VolumeUV, Page);
+                float DFValue = GDFPageAtlasTexture.SampleLevel(GDFPageAtlasSampler, PageUV, 0).x;
+                if (DFValue < 1.0f)
+                {
+                    Distance = DecodeGDFDistance(DFValue, InfluenceRange);
+                    break;
+                }
+            }
+        }
+    }
+    return Distance;
+}
+
+float3 SampleGDFNormal(float3 TranslatedWorldPos)
+{
+    float Step = 0.5f * GDFTranslatedCenterAndExtent[0].w * GDFVolumeTexelSize;
+    float dx = SampleGDFDistance(TranslatedWorldPos + float3(Step, 0, 0)) - SampleGDFDistance(TranslatedWorldPos - float3(Step, 0, 0));
+    float dy = SampleGDFDistance(TranslatedWorldPos + float3(0, Step, 0)) - SampleGDFDistance(TranslatedWorldPos - float3(0, Step, 0));
+    float dz = SampleGDFDistance(TranslatedWorldPos + float3(0, 0, Step)) - SampleGDFDistance(TranslatedWorldPos - float3(0, 0, Step));
+    float3 Grad = float3(dx, dy, dz);
+    float Len = length(Grad);
+    return Len > 1e-6f ? Grad / Len : float3(0, 0, 1);
+}
+
+[numthreads(64, 1, 1)]
+void CollideGDFCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return;
+
+    float3 TranslatedWorldPos = P.Position + PreViewTranslation;
+    float d = SampleGDFDistance(TranslatedWorldPos);
+
+    float CollisionDepth = ParticleRadius - d;
+    if (CollisionDepth > 0.0f)
+    {
+        float3 N = SampleGDFNormal(TranslatedWorldPos);
+
+        // 限制单步最大推出量，防止深穿透一脚踢飞
+        CollisionDepth = min(CollisionDepth, ParticleRadius);
+
+        // 1. 当前速度
+        float3 Vel = (P.Position - P.PrevPosition) / SubstepTime;
+
+        // 2. 分解法向/切向
+        float Vn = dot(Vel, N);
+        float3 Vt = Vel - N * Vn;
+
+        // 3. 速度修正: 恢复系数 0 (朝表面撞时法向速度清零) + 摩擦
+        float VnNew = Vn < 0.0f ? 0.0f : Vn;
+        Vt *= saturate(1.0f - GDFFriction);
+
+        // 4. 推出位置
+        P.Position += N * CollisionDepth;
+
+        // 5. 写回 PrevPosition，使 UpdateVelocityCS 复现修正后的速度 (不再注入反弹能量)
+        P.PrevPosition = P.Position - (N * VnNew + Vt) * SubstepTime;
+
+        RWParticles[idx] = P;
+    }
 }

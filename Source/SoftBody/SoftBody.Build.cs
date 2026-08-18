@@ -2,6 +2,8 @@
 
 using System.IO;
 using UnrealBuildTool;
+using EpicGames.Core;
+using Microsoft.Extensions.Logging;
 
 public class SoftBody : ModuleRules
 {
@@ -35,38 +37,49 @@ public class SoftBody : ModuleRules
 
 		// To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
 		// =========================================================
-		// [新增] OpenHaptics 第三方库集成
+		// OpenHaptics 触觉集成开关
+		// 设为 false 时不链接 hd/hl，OpenHapticsComponent 编译为空桩。
+		// 需要触觉设备时改回 true，并确保 ThirdParty/OpenHaptics 里有 hd.dll/hl.dll/PhantomIoLib42.dll。
 		// =========================================================
-       
-		// 1. 自动定位 ThirdParty 目录
-		// ModuleDirectory 是 Build.cs 所在的目录 (Source/SoftBody/)
-		// 我们需要往上退两级找到 SoftBody/ThirdParty/OpenHaptics
-		string OpenHapticsPath = Path.Combine(ModuleDirectory, "../../ThirdParty/OpenHaptics");
+		bool bUseOpenHaptics = false;
+		PublicDefinitions.Add("SOFTBODY_USE_OPENHAPTICS=" + (bUseOpenHaptics ? "1" : "0"));
 
-		// 2. 添加头文件包含路径
-		// 这样你在代码里就可以写 #include <HD/hd.h>
-		string IncludePath = Path.Combine(OpenHapticsPath, "include");
-		PublicIncludePaths.Add(IncludePath);
+		if (bUseOpenHaptics)
+		{
+			// 1. 自动定位 ThirdParty 目录
+			// ModuleDirectory 是 Build.cs 所在的目录 (Source/SoftBody/)
+			// 我们需要往上退两级找到 SoftBody/ThirdParty/OpenHaptics
+			string OpenHapticsPath = Path.Combine(ModuleDirectory, "../../ThirdParty/OpenHaptics");
 
-		// 3. 确定库文件路径 (根据编译配置选择 Debug 或 Release)
-		string LibPath = Path.Combine(OpenHapticsPath, "lib/x64/Release");
+			// 2. 添加头文件包含路径
+			// 这样你在代码里就可以写 #include <HD/hd.h>
+			string IncludePath = Path.Combine(OpenHapticsPath, "include");
+			PublicIncludePaths.Add(IncludePath);
 
-		// 4. 链接静态库 (.lib)
-		// 只需要 hd.lib 和 hl.lib 
-		PublicAdditionalLibraries.Add(Path.Combine(LibPath, "hd.lib"));
-		PublicAdditionalLibraries.Add(Path.Combine(LibPath, "hl.lib"));
+			// 3. 确定库文件路径
+			string LibPath = Path.Combine(OpenHapticsPath, "lib/x64/Release");
 
-		// 5. [必须] 运行时 DLL 拷贝
-		// 这里的路径要指向你截图里的 lib/x64/Release/hd.dll
-		// 注意：需要区分 Debug 和 Release 文件夹
-       
-		string DllSourcePath = Path.Combine(LibPath, "hd.dll"); 
-		string HlDllSourcePath = Path.Combine(LibPath, "hl.dll");
+			// 4. 链接静态库 (.lib)
+			PublicAdditionalLibraries.Add(Path.Combine(LibPath, "hd.lib"));
+			PublicAdditionalLibraries.Add(Path.Combine(LibPath, "hl.lib"));
 
-		// 告诉 UE：这个文件是运行时依赖，打包时请带上它
-		// 第二个参数是 "Staged Path"，也就是打包后的目标路径
-		// "$(BinaryOutputDir)/hd.dll" 表示复制到 exe 旁边
-		RuntimeDependencies.Add("$(BinaryOutputDir)/hd.dll", DllSourcePath);
-		RuntimeDependencies.Add("$(BinaryOutputDir)/hl.dll", HlDllSourcePath);
+			// 5. 运行时 DLL 拷贝
+			string DllSourcePath = Path.Combine(LibPath, "hd.dll");
+			string HlDllSourcePath = Path.Combine(LibPath, "hl.dll");
+			RuntimeDependencies.Add("$(BinaryOutputDir)/hd.dll", DllSourcePath);
+			RuntimeDependencies.Add("$(BinaryOutputDir)/hl.dll", HlDllSourcePath);
+
+			// 6. hd.dll 依赖 PhantomIoLib42.dll (Phantom 设备 I/O 库)
+			// 它随 OpenHaptics SDK 的 bin 目录分发，不在 lib 目录里。
+			string PhantomIoDllSourcePath = Path.Combine(LibPath, "PhantomIoLib42.dll");
+			if (File.Exists(PhantomIoDllSourcePath))
+			{
+				RuntimeDependencies.Add("$(BinaryOutputDir)/PhantomIoLib42.dll", PhantomIoDllSourcePath);
+			}
+			else
+			{
+				Logger.LogWarning("PhantomIoLib42.dll not found in {0}. The SoftBody module will fail to load at runtime. Copy PhantomIoLib42.dll from the OpenHaptics SDK into this folder.", LibPath);
+			}
+		}
 	}
 }

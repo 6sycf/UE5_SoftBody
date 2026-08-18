@@ -12,7 +12,8 @@ public class SoftBodyGPU : ModuleRules
 			"Engine", 
 			"RenderCore", 
 			"RHI", 
-			"Projects" 
+			"Projects",
+			"Renderer"
 		});
 		string ShaderDir = Path.Combine(ModuleDirectory, "../../Shaders");
 		if (Directory.Exists(ShaderDir))

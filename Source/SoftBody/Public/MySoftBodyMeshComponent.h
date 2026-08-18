@@ -15,6 +15,8 @@ class HashGrid;
 struct FMySoftBodyConstraint;
 class UOpenHapticsComponent;
 class FRHIGPUBufferReadback;
+struct FSoftBodyGDFCacheData;
+class ISceneViewExtension;
 
 
 // =========================================================
@@ -189,6 +191,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bWorldCollision;
 
+    // 是否使用全局距离场 (GDF) 做静态网格体碰撞 (GPU 路径)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
+    bool bUseDistanceFieldCollision = false;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUseGPU = false;
 
@@ -209,9 +215,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Soft Body Simulation", meta = (UIMin = "1.0", UIMax = "10000.0"))
     float Grid_Size;
-    
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
-    float GroundGPU;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUse_BendingForce;
@@ -473,6 +476,11 @@ private:
     TRefCountPtr<FRDGPooledBuffer> ProxyTrianglePooledBuffer;
     
     bool bGPUResourcesInitialized = false;
+
+    // --- 全局距离场 (GDF) 碰撞缓存 ---
+    // 渲染线程写入 (视图扩展)，独立 RDG pass 读取
+    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> GDFCache;
+    TSharedPtr<ISceneViewExtension, ESPMode::ThreadSafe> GDFViewExtension;
 
     // --- 二面角 GPU 资源 ---
     TRefCountPtr<FRDGPooledBuffer> DihedralConstraintPooledBuffer;

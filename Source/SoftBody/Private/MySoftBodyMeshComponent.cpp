@@ -19,7 +19,85 @@
 #include "RHIGPUReadback.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Runtime/GeometryFramework/Private/Components/DynamicMeshSceneProxy.h"
+#include "SceneViewExtension.h"
+#include "SceneView.h"
+#include "EngineModule.h"
+#include "GlobalDistanceFieldParameters.h"
+#include "RHIStaticStates.h"
 
+
+// =========================================================
+// 全局距离场 (GDF) 缓存与视图扩展
+// 参考 Niagara: 渲染管线内缓存 FGlobalDistanceFieldParameterData，
+// 供脱离渲染器场景的独立 RDG pass 复用。
+// =========================================================
+struct FSoftBodyGDFCacheData
+{
+    FGlobalDistanceFieldParameterData GDFData;
+    // 持有原始纹理引用，避免 RDG 帧销毁后纹理被释放
+    FTextureRHIRef PageAtlasTexture;
+    FTextureRHIRef CoverageAtlasTexture;
+    FTextureRHIRef PageTableTexture;
+    FTextureRHIRef MipTexture;
+    FVector PreViewTranslation = FVector::ZeroVector;
+    bool bValid = false;
+};
+
+class FSoftBodyGDFViewExtension : public FSceneViewExtensionBase
+{
+public:
+    FSoftBodyGDFViewExtension(const FAutoRegister& AutoRegister, TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> InCache)
+        : FSceneViewExtensionBase(AutoRegister)
+        , Cache(InCache)
+    {}
+
+    virtual void PostRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily) override
+    {
+        if (!Cache.IsValid())
+        {
+            return;
+        }
+
+        const FSceneView* View = InViewFamily.Views.Num() > 0 ? InViewFamily.Views[0] : nullptr;
+        if (!View || !View->bIsViewInfo)
+        {
+            if (Cache->bValid)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] no valid view, cache invalidated"));
+            }
+            Cache->bValid = false;
+            return;
+        }
+
+        if (const FGlobalDistanceFieldParameterData* GDFData = GetRendererModule().GetGlobalDistanceFieldParameterData(*View))
+        {
+            Cache->GDFData = *GDFData;
+            Cache->PageAtlasTexture = GDFData->PageAtlasTexture;
+            Cache->CoverageAtlasTexture = GDFData->CoverageAtlasTexture;
+            Cache->PageTableTexture = GDFData->PageTableTexture;
+            Cache->MipTexture = GDFData->MipTexture;
+            Cache->PreViewTranslation = View->ViewMatrices.GetPreViewTranslation();
+            bool bNewValid = (GDFData->PageAtlasTexture != nullptr) && (GDFData->PageTableTexture != nullptr);
+            if (bNewValid != Cache->bValid)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] cache validity: %d -> %d (PageAtlas=%p PageTable=%p NumClipmaps=%d)"),
+                    Cache->bValid, bNewValid, GDFData->PageAtlasTexture, GDFData->PageTableTexture, GDFData->NumGlobalSDFClipmaps);
+            }
+            Cache->bValid = bNewValid;
+        }
+        else
+        {
+            if (Cache->bValid)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] GetGlobalDistanceFieldParameterData returned null"));
+            }
+            Cache->bValid = false;
+        }
+    }
+
+private:
+    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> Cache;
+};
 
 // =========================================================
 // 通用 GPU 回读辅助函数
@@ -120,7 +198,6 @@ UMySoftBodyMeshComponent::UMySoftBodyMeshComponent(const FObjectInitializer& Obj
     Cells_PerDim = 4;
     bShow_Grid = false;
     bShow_Normals = false;
-    GroundGPU = 0.0f;
     ParticleMass = 1.0f;
     ParticleRadius = 5.0f;
  
@@ -142,6 +219,9 @@ UMySoftBodyMeshComponent::UMySoftBodyMeshComponent(const FObjectInitializer& Obj
 
 UMySoftBodyMeshComponent::~UMySoftBodyMeshComponent()
 {
+    // 释放视图扩展引用 (销毁时自动注销)
+    GDFViewExtension.Reset();
+    GDFCache.Reset();
     ReleaseGPUResources();
 }
 
@@ -156,6 +236,16 @@ void UMySoftBodyMeshComponent::OnRegister()
     if (World && World->IsGameWorld())
     {
         BuildClothState();
+
+        // 创建全局距离场缓存 + 视图扩展 (每个组件一个)
+        if (!GDFCache.IsValid())
+        {
+            GDFCache = MakeShared<FSoftBodyGDFCacheData, ESPMode::ThreadSafe>();
+        }
+        if (!GDFViewExtension.IsValid())
+        {
+            GDFViewExtension = FSceneViewExtensions::NewExtension<FSoftBodyGDFViewExtension>(GDFCache);
+        }
     }
     else
     {
@@ -2611,10 +2701,8 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
     int32 NumProxyParticles = ProxyParticleCount;
     int32 NumHighResParticles = HighResParticleCount;
     bool bUseVolume = bUse_VolumePressureForce;
-    bool bUseWorldCollision = bWorldCollision;
     float LocalRestVolume = restVolume;
     float LocalVolCoeff = VolPressure_Coefficient;
-    float GroundGPUDate = GroundGPU;
     float SubstepDt = St;
     int32 Iterations = ConstraintIterations;
     float OmegaVal = 0.5f; // 松弛因子
@@ -2675,6 +2763,8 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
     TRefCountPtr<FRDGPooledBuffer> D_InfoBuf = DihedralNeighborInfoPooledBuffer;
     TRefCountPtr<FRDGPooledBuffer> D_AdjBuf = DihedralAdjacencyPooledBuffer;
     int32 NumDihedrals = bUse_DihedralBending ? DihedralConstraints.Num() : 0;
+    bool bLocalUseDFCollision = bUseDistanceFieldCollision;
+    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> LocalGDFCache = GDFCache;
     ENQUEUE_RENDER_COMMAND(DispatchSoftBodyXPBD)(
         [=, this](FRHICommandListImmediate& RHICmdList)
         {
@@ -2960,19 +3050,35 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
                     FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideStick"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
                 }
             }
-            // ========== 地面碰撞 ==========
-            if (bUseWorldCollision)
+            // ========== 全局距离场碰撞 ==========
+            if (bLocalUseDFCollision && LocalGDFCache.IsValid() && LocalGDFCache->bValid
+                && LocalGDFCache->GDFData.PageAtlasTexture && LocalGDFCache->GDFData.PageTableTexture)
             {
-                TShaderMapRef<FCollideGroundCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-                auto* Params = GraphBuilder.AllocParameters<FCollideGroundCS::FParameters>();
+                FRDGTextureRef GDFPageAtlasRDG = RegisterExternalTexture(GraphBuilder, LocalGDFCache->GDFData.PageAtlasTexture, TEXT("GDFPageAtlas"));
+                FRDGTextureRef GDFPageTableRDG = RegisterExternalTexture(GraphBuilder, LocalGDFCache->GDFData.PageTableTexture, TEXT("GDFPageTable"));
+
+                TShaderMapRef<FCollideGDFCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+                auto* Params = GraphBuilder.AllocParameters<FCollideGDFCS::FParameters>();
                 Params->RWParticles = ProxyParticleUAV;
-                Params->ParticleCount = NumParticles;
-                Params->GroundZ = GroundGPUDate;
+                Params->GDFPageAtlasTexture = GDFPageAtlasRDG;
+                Params->GDFPageTableTexture = GDFPageTableRDG;
+                Params->GDFPageAtlasSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+                for (int32 i = 0; i < GlobalDistanceField::MaxClipmaps; ++i)
+                {
+                    Params->GDFTranslatedCenterAndExtent[i] = LocalGDFCache->GDFData.TranslatedCenterAndExtent[i];
+                    Params->GDFTranslatedWorldToUVAddAndMul[i] = LocalGDFCache->GDFData.TranslatedWorldToUVAddAndMul[i];
+                }
+                Params->GDFInvPageAtlasSize = FVector3f(LocalGDFCache->GDFData.InvPageAtlasSize);
+                Params->GDFClipmapSizeInPages = (uint32)LocalGDFCache->GDFData.ClipmapSizeInPages;
+                Params->GDFVolumeTexelSize = 1.0f / LocalGDFCache->GDFData.GlobalDFResolution;
+                Params->NumGDFClipmaps = (uint32)LocalGDFCache->GDFData.NumGlobalSDFClipmaps;
+                Params->ParticleCount = (uint32)NumParticles;
                 Params->ParticleRadius = PartR;
-                Params->GroundFriction = LocalFriction;      // 新增
-                Params->GroundRestitution = LocalRestitution; // 新增
+                Params->PreViewTranslation = FVector3f(LocalGDFCache->PreViewTranslation);
                 Params->SubstepTime = SubstepDt;
-                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideGround"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
+                Params->GDFFriction = LocalFriction;
+
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideGDF"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
             }
 
             // 4. 更新速度

@@ -19,10 +19,10 @@ IMPLEMENT_GLOBAL_SHADER(FComputeWeightedNormalsCS, "/SoftBodyGPU/Private/SoftBod
 IMPLEMENT_GLOBAL_SHADER(FComputeVolumeCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ComputeVolumeCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FApplyVolumePressureCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ApplyVolumePressureCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FClearVolumeCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ClearVolumeCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FCollideGroundCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "CollideGroundCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FExportNormalsCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ExportNormalsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FExportVolumeCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ExportVolumeCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUpdateHighResTargetCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "UpdateHighResTargetCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSolveDihedralCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "SolveDihedralCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUpdateDihedralLambdasCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "UpdateDihedralLambdasCS", SF_Compute); 
 IMPLEMENT_GLOBAL_SHADER(FExportToTextureCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ExportToTextureCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCollideGDFCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "CollideGDFCS", SF_Compute);

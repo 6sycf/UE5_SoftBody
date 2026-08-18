@@ -4,7 +4,9 @@
 
 #include "CoreMinimal.h"
 #include "Components/SceneComponent.h"
+#if SOFTBODY_USE_OPENHAPTICS
 #include <HD/hd.h>
+#endif
 #include "OpenHapticsComponent.generated.h"
 
 struct FHapticToolState
@@ -115,9 +117,11 @@ protected:
 	float StiffnessBlendSpeed = 15.0f;
 	
 private:
+#if SOFTBODY_USE_OPENHAPTICS
 	// --- OpenHaptics 句柄 ---
 	HHD hHD = HD_INVALID_HANDLE;
 	HDSchedulerHandle hUpdateCallback = HD_INVALID_HANDLE;
+#endif
 
 	// 三个独立的工具状态
 	// 1. 定位工具 (Device Tool):  
@@ -151,7 +155,9 @@ private:
 	// --- 内部状态 ---
 	bool bIsDeviceValid = false;
 
+#if SOFTBODY_USE_OPENHAPTICS
 	// --- 静态回调函数 ---
 	// 这是运行在 1000Hz 触觉线程里的函数
 	static HDCallbackCode HDCALLBACK DeviceLoopCallback(void* pUserData);
+#endif
 };

@@ -3,6 +3,8 @@
 
 #include "OpenHapticsComponent.h"
 
+#if SOFTBODY_USE_OPENHAPTICS
+
 // Sets default values for this component's properties
 UOpenHapticsComponent::UOpenHapticsComponent()
 {
@@ -409,3 +411,71 @@ void UOpenHapticsComponent::UpdateVisualStateFromPhysics(const FVector& NewStart
 		Shared_FromGame_VisualState = Tool_Visual;
 	}
 }
+
+#else // !SOFTBODY_USE_OPENHAPTICS
+
+// =========================================================
+// 触觉集成已禁用时的空实现 (SOFTBODY_USE_OPENHAPTICS=0)
+// =========================================================
+UOpenHapticsComponent::UOpenHapticsComponent()
+{
+	PrimaryComponentTick.bCanEverTick = true;
+	VisualMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("HapticDeviceMesh"));
+	VisualMesh->SetCollisionProfileName(TEXT("NoCollision"));
+	VisualMesh->SetGenerateOverlapEvents(false);
+	VisualOffset = FTransform::Identity;
+}
+
+UOpenHapticsComponent::~UOpenHapticsComponent()
+{
+}
+
+void UOpenHapticsComponent::BeginPlay()
+{
+	Super::BeginPlay();
+}
+
+void UOpenHapticsComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+}
+
+void UOpenHapticsComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+}
+
+void UOpenHapticsComponent::SetCollisionState(bool bIsColliding)
+{
+}
+
+bool UOpenHapticsComponent::IsButton1Pressed() const
+{
+	return false;
+}
+
+bool UOpenHapticsComponent::IsButton2Pressed() const
+{
+	return false;
+}
+
+FTransform UOpenHapticsComponent::GetDeviceTransform() const
+{
+	return GetComponentTransform();
+}
+
+FHapticToolState UOpenHapticsComponent::GetHapticToolState() const
+{
+	return Tool_Visual;
+}
+
+FVector UOpenHapticsComponent::GetDevicePosition() const
+{
+	return FVector::ZeroVector;
+}
+
+void UOpenHapticsComponent::UpdateVisualStateFromPhysics(const FVector& NewStart, const FVector& NewEnd)
+{
+}
+
+#endif // SOFTBODY_USE_OPENHAPTICS
