@@ -689,18 +689,19 @@ void ExportToTextureCS(uint3 DTid : SV_DispatchThreadID)
 #define GDF_INFLUENCE_RANGE_IN_VOXELS 4
 #define GDF_INVALID_PAGE_ID 0xFFFFFFFFu
 
-Texture3D GDFPageAtlasTexture;
-Texture3D<uint> GDFPageTableTexture;
-SamplerState GDFPageAtlasSampler;
+Texture3D GlobalDistanceFieldPageAtlasTexture;
+Texture3D<uint> GlobalDistanceFieldPageTableTexture;
+SamplerState GlobalDistanceFieldPageAtlasTextureSampler;
 
-float4 GDFTranslatedCenterAndExtent[MAX_GDF_CLIPMAPS];
-float4 GDFTranslatedWorldToUVAddAndMul[MAX_GDF_CLIPMAPS];
-float3 GDFInvPageAtlasSize;
-uint GDFClipmapSizeInPages;
-float GDFVolumeTexelSize;
-uint NumGDFClipmaps;
+float4 GlobalVolumeTranslatedCenterAndExtent[MAX_GDF_CLIPMAPS];
+float4 GlobalVolumeTranslatedWorldToUVAddAndMul[MAX_GDF_CLIPMAPS];
+float3 GlobalDistanceFieldInvPageAtlasSize;
+uint GlobalDistanceFieldClipmapSizeInPages;
+float GlobalVolumeTexelSize;
+uint NumGlobalSDFClipmaps;
 float3 PreViewTranslation;
 float GDFFriction;
+float GDFSkinOffset;
 
 struct FGDFPage
 {
@@ -729,22 +730,22 @@ FGDFPage UnpackGDFPage(uint Packed)
 
 FGDFPage GetGDFPage(float3 VolumeUV, uint ClipmapIndex)
 {
-    int4 Coord = int4(saturate(VolumeUV) * GDFClipmapSizeInPages + int3(0, 0, ClipmapIndex * GDFClipmapSizeInPages), 0);
-    uint Packed = GDFPageTableTexture.Load(Coord).x;
+    int4 Coord = int4(saturate(VolumeUV) * GlobalDistanceFieldClipmapSizeInPages + int3(0, 0, ClipmapIndex * GlobalDistanceFieldClipmapSizeInPages), 0);
+    uint Packed = GlobalDistanceFieldPageTableTexture.Load(Coord).x;
     return UnpackGDFPage(Packed);
 }
 
 float3 ComputeGDFPageUV(float3 VolumeUV, FGDFPage Page)
 {
     uint3 AtlasOffset = GDFPageLinearIndexToPageAtlasOffset(Page);
-    float3 VolumePageUV = frac(VolumeUV * GDFClipmapSizeInPages);
+    float3 VolumePageUV = frac(VolumeUV * GlobalDistanceFieldClipmapSizeInPages);
     float3 AtlasCoord = AtlasOffset * GDF_PAGE_RESOLUTION_IN_ATLAS + VolumePageUV * GDF_PAGE_RESOLUTION + 0.5f;
-    return AtlasCoord * GDFInvPageAtlasSize;
+    return AtlasCoord * GlobalDistanceFieldInvPageAtlasSize;
 }
 
 float3 ComputeGDFUV(float3 TranslatedWorldPos, uint ClipmapIndex)
 {
-    float4 AddAndMul = GDFTranslatedWorldToUVAddAndMul[ClipmapIndex];
+    float4 AddAndMul = GlobalVolumeTranslatedWorldToUVAddAndMul[ClipmapIndex];
     float3 UV = frac(TranslatedWorldPos * AddAndMul.www + AddAndMul.xyz);
     UV = frac(UV);
     return UV;
@@ -766,11 +767,11 @@ float GDFDistanceFromBoxToPointInside(float3 BoxCenter, float3 BoxExtent, float3
 float SampleGDFDistance(float3 TranslatedWorldPos)
 {
     float Distance = 0.0f;
-    for (uint ClipmapIndex = 0; ClipmapIndex < NumGDFClipmaps; ClipmapIndex++)
+    for (uint ClipmapIndex = 0; ClipmapIndex < NumGlobalSDFClipmaps; ClipmapIndex++)
     {
-        float3 Center = GDFTranslatedCenterAndExtent[ClipmapIndex].xyz;
-        float3 Extent = GDFTranslatedCenterAndExtent[ClipmapIndex].www;
-        float ClipmapVoxelExtent = GDFTranslatedCenterAndExtent[ClipmapIndex].w * GDFVolumeTexelSize;
+        float3 Center = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].xyz;
+        float3 Extent = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].www;
+        float ClipmapVoxelExtent = GlobalVolumeTranslatedCenterAndExtent[ClipmapIndex].w * GlobalVolumeTexelSize;
         float InfluenceRange = 2.0f * GDF_INFLUENCE_RANGE_IN_VOXELS * ClipmapVoxelExtent;
 
         Distance = InfluenceRange;
@@ -781,7 +782,7 @@ float SampleGDFDistance(float3 TranslatedWorldPos)
             if (Page.bValid)
             {
                 float3 PageUV = ComputeGDFPageUV(VolumeUV, Page);
-                float DFValue = GDFPageAtlasTexture.SampleLevel(GDFPageAtlasSampler, PageUV, 0).x;
+                float DFValue = GlobalDistanceFieldPageAtlasTexture.SampleLevel(GlobalDistanceFieldPageAtlasTextureSampler, PageUV, 0).x;
                 if (DFValue < 1.0f)
                 {
                     Distance = DecodeGDFDistance(DFValue, InfluenceRange);
@@ -795,7 +796,8 @@ float SampleGDFDistance(float3 TranslatedWorldPos)
 
 float3 SampleGDFNormal(float3 TranslatedWorldPos)
 {
-    float Step = 0.5f * GDFTranslatedCenterAndExtent[0].w * GDFVolumeTexelSize;
+    // 步长 = 1 个体素 (而非 0.5)，梯度更稳定，减少抖动
+    float Step = GlobalVolumeTranslatedCenterAndExtent[0].w * GlobalVolumeTexelSize;
     float dx = SampleGDFDistance(TranslatedWorldPos + float3(Step, 0, 0)) - SampleGDFDistance(TranslatedWorldPos - float3(Step, 0, 0));
     float dy = SampleGDFDistance(TranslatedWorldPos + float3(0, Step, 0)) - SampleGDFDistance(TranslatedWorldPos - float3(0, Step, 0));
     float dz = SampleGDFDistance(TranslatedWorldPos + float3(0, 0, Step)) - SampleGDFDistance(TranslatedWorldPos - float3(0, 0, Step));
@@ -816,29 +818,23 @@ void CollideGDFCS(uint3 DTid : SV_DispatchThreadID)
     float3 TranslatedWorldPos = P.Position + PreViewTranslation;
     float d = SampleGDFDistance(TranslatedWorldPos);
 
-    float CollisionDepth = ParticleRadius - d;
+    // ===== 诊断: 正常的碰撞响应，先跑通再谈调参 =====
+    float ContactThreshold = ParticleRadius + GDFSkinOffset;
+    float CollisionDepth = ContactThreshold - d;
     if (CollisionDepth > 0.0f)
     {
         float3 N = SampleGDFNormal(TranslatedWorldPos);
 
-        // 限制单步最大推出量，防止深穿透一脚踢飞
-        CollisionDepth = min(CollisionDepth, ParticleRadius);
+        float MaxPush = max(ParticleRadius * 1.5f, GDFSkinOffset * 2.0f);
+        CollisionDepth = min(CollisionDepth, MaxPush);
 
-        // 1. 当前速度
         float3 Vel = (P.Position - P.PrevPosition) / SubstepTime;
-
-        // 2. 分解法向/切向
         float Vn = dot(Vel, N);
         float3 Vt = Vel - N * Vn;
-
-        // 3. 速度修正: 恢复系数 0 (朝表面撞时法向速度清零) + 摩擦
         float VnNew = Vn < 0.0f ? 0.0f : Vn;
         Vt *= saturate(1.0f - GDFFriction);
 
-        // 4. 推出位置
         P.Position += N * CollisionDepth;
-
-        // 5. 写回 PrevPosition，使 UpdateVelocityCS 复现修正后的速度 (不再注入反弹能量)
         P.PrevPosition = P.Position - (N * VnNew + Vt) * SubstepTime;
 
         RWParticles[idx] = P;

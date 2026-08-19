@@ -11,12 +11,14 @@
 #define INLINE __forceinline
 
 // 前置声明
-class HashGrid;
 struct FMySoftBodyConstraint;
 class UOpenHapticsComponent;
 class FRHIGPUBufferReadback;
-struct FSoftBodyGDFCacheData;
 class ISceneViewExtension;
+class FGlobalDistanceFieldParameterData;
+struct IPooledRenderTarget;
+class FViewInfo;
+struct FSoftBodyGDFCacheData;
 
 
 // =========================================================
@@ -31,7 +33,6 @@ struct FMySoftBodyParticle
         , Force(0, 0, 0)
         , Col(255, 255, 255, 255)
         , ID(-1)
-        , C_idx(-1)
         , state(1)
         , conCount(0)
     {}
@@ -43,7 +44,6 @@ struct FMySoftBodyParticle
     FColor Col;            // 粒子颜色 (调试或渲染用)
 
     int32 ID;              // 粒子索引
-    uint32 C_idx;          // 哈希网格单元索引 (用于自碰撞加速)
     int8 state;            // 状态: 1=活动, 0=固定(Pinned)
     int8 conCount;         // 连接的约束数量
     float InvMass = 1.0f;
@@ -118,6 +118,12 @@ public:
     // --- UActorComponent Overrides ---
     virtual void OnRegister() override;
     virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+
+    // 在场景渲染管线内提取 GDF 稳定纹理 (由视图扩展调用)
+    void ExtractGDF(FRDGBuilder& GraphBuilder, const FViewInfo& View);
+
+    // 在独立模拟 graph 内插入 GDF 碰撞 pass (从缓存读取)
+    void AddGDFCollisionPass(FRDGBuilder& GraphBuilder);
 
 #if WITH_EDITOR
     // 监听编辑器属性修改，防止崩溃
@@ -195,6 +201,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUseDistanceFieldCollision = false;
 
+    // GDF 碰撞的接触容差缓冲带 (cm)。把表面"往外扩"这段距离，
+    // 粒子在缓冲带内就被稳妥推出，避免在表面边界上来回震荡/穿模。
+    // 值太小会抖，值太大会让软体"悬浮"在表面外。默认 1cm。
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation", meta = (ClampMin = "0.0", ClampMax = "20.0", EditCondition = "bUseDistanceFieldCollision"))
+    float GDFSkinOffset = 1.0f;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUseGPU = false;
 
@@ -204,18 +216,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation", meta = (ClampMin = "0.0", ClampMax = "2.0", EditCondition = "bWorldCollision"))
     float CollisionRestitution;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
-    bool bSelfCollision;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation", meta = (ClampMin = "1", ClampMax = "8"))
-    int32 SelfColIterations;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation", meta = (ClampMin = "0", ClampMax = "100"))
-    int32 Cells_PerDim;
-
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Soft Body Simulation", meta = (UIMin = "1.0", UIMax = "10000.0"))
-    float Grid_Size;
-    
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUse_BendingForce;
     
@@ -243,9 +243,6 @@ public:
     float HapticFeedbackStiffness = 0.5f;
 
     // --- Debug ---
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Debug")
-    bool bShow_Grid;
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Debug")
     bool bShow_Constraints;
 
@@ -298,9 +295,6 @@ public:
     
     void FixCantileverEdge(float Tolerance = 2.0f, int32 Axis = 0);
 public:
-    // 友元声明
-    friend class HashGrid;
-
     // =========================================================
     // 核心数据 (Core Data)
     // =========================================================
@@ -477,10 +471,10 @@ private:
     
     bool bGPUResourcesInitialized = false;
 
-    // --- 全局距离场 (GDF) 碰撞缓存 ---
-    // 渲染线程写入 (视图扩展)，独立 RDG pass 读取
-    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> GDFCache;
+    // --- 全局距离场 (GDF) 碰撞 ---
+    // 视图扩展每帧提取稳定 pooled texture 缓存，独立模拟 graph 采样
     TSharedPtr<ISceneViewExtension, ESPMode::ThreadSafe> GDFViewExtension;
+    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> GDFCache;
 
     // --- 二面角 GPU 资源 ---
     TRefCountPtr<FRDGPooledBuffer> DihedralConstraintPooledBuffer;

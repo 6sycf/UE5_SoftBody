@@ -29,6 +29,12 @@ public class SoftBody : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] { "SoftBodyGPU", "SoftBodyGPU" });
 
+		// 允许访问 Renderer 私有头 (SceneRendering.h / FViewInfo)，用于 GDF 碰撞
+		string RendererPrivate = Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private");
+		string RendererInternal = Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Internal");
+		PrivateIncludePaths.Add(RendererPrivate);
+		PrivateIncludePaths.Add(RendererInternal);
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		

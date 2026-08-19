@@ -1,11 +1,11 @@
-# SoftBody_XPBDGPULOD8
+# SoftBody_XPBDGPU
 
-基于 **Unreal Engine 5.6** 的软体形变模拟项目。物理求解采用 **XPBD（Extended Position Based Dynamics）**，支持 **CPU / GPU 双路径**、**高/低模代理 LOD**，GPU 路径支持 **全局距离场（GDF）静态网格体碰撞**，并集成 **Geomagic OpenHaptics** 触觉力反馈设备的双向耦合交互（当前默认禁用，见下文）。
+基于 **Unreal Engine 5.6** 的软体形变模拟项目。物理求解采用 **XPBD（Extended Position Based Dynamics）**，基于 **GPU 计算**、**高/低模代理 LOD**，支持 **全局距离场（GDF）静态网格体碰撞**，并集成 **Geomagic OpenHaptics** 触觉力反馈设备的双向耦合交互（当前默认禁用，见下文）。
 
 ## 功能特性
 
 - **XPBD 求解器**：距离约束、弯曲约束、二面角弯曲约束、内部支撑约束（ISPC），以及基于散度定理的体积保持。
-- **CPU / GPU 双路径**：可一键切换；GPU 路径基于 UE 的 RDG（Render Graph）+ Compute Shader，含异步双缓冲回读。
+- **GPU 计算路径**：基于 UE 的 RDG（Render Graph）+ Compute Shader，含异步双缓冲回读。
 - **代理 LOD（Proxy）**：用网格简化生成低模 `ProxyMesh` 做物理计算，高模通过重心坐标 + 法线偏移（`FScaffoldBinding`）绑定到低模，低模驱动高模。
 - **VAT 渲染（纯 GPU 变形）**：把高模顶点位移/法线导出到两张 RenderTarget 纹理，材质采样驱动变形，极大提升帧率。
 - **全局距离场碰撞（GPU）**：`CollideGDFCS` 采样 UE 全局距离场（Page Atlas 稀疏 clipmap），粒子按 SDF 距离 + 梯度推出表面，含速度修正（恢复系数 0 + 摩擦）。
@@ -35,7 +35,7 @@ ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
 
 ## 快速开始
 
-1. 用 UE 5.6 打开 `SoftBody_XPBDGPULOD8.uproject`（首次会编译 C++ 模块）。
+1. 用 UE 5.6 打开 `SoftBody_XPBDGPU.uproject`（首次会编译 C++ 模块）。
 2. 在关卡中放置一个 Actor，添加 **`UMySoftBodyMeshComponent`**。
 3. 在组件上指定 **Source Static Mesh**（软体的初始网格）。
 4. 点击 **Build Cloth State**（或游戏运行时 `OnRegister` 自动构建）。
@@ -53,8 +53,7 @@ ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
 | Soft Body Simulation | SubstepTime | 物理子步长（秒），值越小越稳定、开销越大 |
 | | ConstraintIterations | XPBD 约束迭代次数 |
 | | bUseGPU | 是否走 GPU 计算路径 |
-| | bWorldCollision | 是否与场景碰撞体碰撞（CPU 路径） |
-| | bUseDistanceFieldCollision | GPU 路径是否启用全局距离场碰撞（静态网格体） |
+| | bUseDistanceFieldCollision | 是否启用全局距离场碰撞（静态网格体） |
 | XPBD Settings | XPBD_StretchStiffness | 拉伸刚度 |
 | | XPBD_BendingStiffness | 弯曲刚度 |
 | | XPBD_DihedralStiffness | 二面角刚度 |
@@ -80,11 +79,10 @@ IntegrateCS（重力积分）
 
 ## 碰撞
 
-- **全局距离场**：GPU 路径 `CollideGDFCS`（采样 UE 全局距离场，静态网格体碰撞）。
+- **全局距离场**：`CollideGDFCS`（采样 UE 全局距离场，静态网格体碰撞）。
 - **触觉笔**：`CollideStickCS` / `CollideWithHapticStylus`（胶囊体 SDF）。
-- **场景静态网格体（CPU 路径）**：`ClothCollisionWorld()` 使用逐粒子球形扫掠（`SweepSingleByObjectType`）。
 
-> 已知限制：GPU 路径的全局距离场碰撞只覆盖静态网格体，动态物体不在 GDF 中；分辨率随离相机距离下降。CPU 路径用 `ClothCollisionWorld()` 的扫掠检测，支持动态物体。
+> 已知限制：全局距离场碰撞只覆盖静态网格体，动态物体不在 GDF 中；分辨率随离相机距离下降。
 
 ## 版本管理
 

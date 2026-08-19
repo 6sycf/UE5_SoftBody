@@ -24,79 +24,57 @@
 #include "EngineModule.h"
 #include "GlobalDistanceFieldParameters.h"
 #include "RHIStaticStates.h"
+#include "SceneRendering.h"
 
 
 // =========================================================
-// 全局距离场 (GDF) 缓存与视图扩展
-// 参考 Niagara: 渲染管线内缓存 FGlobalDistanceFieldParameterData，
-// 供脱离渲染器场景的独立 RDG pass 复用。
+// 全局距离场 (GDF) 碰撞视图扩展
+// 在场景渲染管线末尾 (PostRenderViewFamily_RenderThread) 提取稳定的 pooled texture，
+// 供独立模拟 RDG graph 在下一帧采样。QueueTextureExtraction 保证纹理不会被池复用回收。
 // =========================================================
 struct FSoftBodyGDFCacheData
 {
     FGlobalDistanceFieldParameterData GDFData;
-    // 持有原始纹理引用，避免 RDG 帧销毁后纹理被释放
-    FTextureRHIRef PageAtlasTexture;
-    FTextureRHIRef CoverageAtlasTexture;
-    FTextureRHIRef PageTableTexture;
-    FTextureRHIRef MipTexture;
+    TRefCountPtr<IPooledRenderTarget> PageAtlasPooled;
+    TRefCountPtr<IPooledRenderTarget> PageTablePooled;
     FVector PreViewTranslation = FVector::ZeroVector;
     bool bValid = false;
 };
 
+class UMySoftBodyMeshComponent;
+
 class FSoftBodyGDFViewExtension : public FSceneViewExtensionBase
 {
 public:
-    FSoftBodyGDFViewExtension(const FAutoRegister& AutoRegister, TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> InCache)
+    FSoftBodyGDFViewExtension(const FAutoRegister& AutoRegister, UMySoftBodyMeshComponent* InOwner)
         : FSceneViewExtensionBase(AutoRegister)
-        , Cache(InCache)
+        , Owner(InOwner)
     {}
 
     virtual void PostRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily) override
     {
-        if (!Cache.IsValid())
+        if (!Owner)
         {
             return;
         }
 
-        const FSceneView* View = InViewFamily.Views.Num() > 0 ? InViewFamily.Views[0] : nullptr;
-        if (!View || !View->bIsViewInfo)
+        const FSceneView* SceneView = InViewFamily.Views.Num() > 0 ? InViewFamily.Views[0] : nullptr;
+        if (!SceneView || !SceneView->bIsViewInfo)
         {
-            if (Cache->bValid)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] no valid view, cache invalidated"));
-            }
-            Cache->bValid = false;
             return;
         }
 
-        if (const FGlobalDistanceFieldParameterData* GDFData = GetRendererModule().GetGlobalDistanceFieldParameterData(*View))
+        const FViewInfo& View = static_cast<const FViewInfo&>(*SceneView);
+        if (!View.GlobalDistanceFieldInfo.bInitialized)
         {
-            Cache->GDFData = *GDFData;
-            Cache->PageAtlasTexture = GDFData->PageAtlasTexture;
-            Cache->CoverageAtlasTexture = GDFData->CoverageAtlasTexture;
-            Cache->PageTableTexture = GDFData->PageTableTexture;
-            Cache->MipTexture = GDFData->MipTexture;
-            Cache->PreViewTranslation = View->ViewMatrices.GetPreViewTranslation();
-            bool bNewValid = (GDFData->PageAtlasTexture != nullptr) && (GDFData->PageTableTexture != nullptr);
-            if (bNewValid != Cache->bValid)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] cache validity: %d -> %d (PageAtlas=%p PageTable=%p NumClipmaps=%d)"),
-                    Cache->bValid, bNewValid, GDFData->PageAtlasTexture, GDFData->PageTableTexture, GDFData->NumGlobalSDFClipmaps);
-            }
-            Cache->bValid = bNewValid;
+            return;
         }
-        else
-        {
-            if (Cache->bValid)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("[SoftBodyGDF] GetGlobalDistanceFieldParameterData returned null"));
-            }
-            Cache->bValid = false;
-        }
+
+        Owner->ExtractGDF(GraphBuilder, View);
     }
 
 private:
-    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> Cache;
+    UMySoftBodyMeshComponent* Owner = nullptr;
 };
 
 // =========================================================
@@ -192,11 +170,6 @@ UMySoftBodyMeshComponent::UMySoftBodyMeshComponent(const FObjectInitializer& Obj
     bWorldCollision = true;
     CollisionFriction = 0.2f;
     CollisionRestitution = 0.2f;
-    bSelfCollision = false;
-    SelfColIterations = 4;
-    Grid_Size = 100.0f;
-    Cells_PerDim = 4;
-    bShow_Grid = false;
     bShow_Normals = false;
     ParticleMass = 1.0f;
     ParticleRadius = 5.0f;
@@ -237,14 +210,14 @@ void UMySoftBodyMeshComponent::OnRegister()
     {
         BuildClothState();
 
-        // 创建全局距离场缓存 + 视图扩展 (每个组件一个)
+        // 创建 GDF 缓存 + 碰撞视图扩展 (每个组件一个)
         if (!GDFCache.IsValid())
         {
             GDFCache = MakeShared<FSoftBodyGDFCacheData, ESPMode::ThreadSafe>();
         }
         if (!GDFViewExtension.IsValid())
         {
-            GDFViewExtension = FSceneViewExtensions::NewExtension<FSoftBodyGDFViewExtension>(GDFCache);
+            GDFViewExtension = FSceneViewExtensions::NewExtension<FSoftBodyGDFViewExtension>(this);
         }
     }
     else
@@ -2729,6 +2702,7 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
 
     float LocalFriction = CollisionFriction;
     float LocalRestitution = CollisionRestitution;
+    float LocalGDFSkinOffset = GDFSkinOffset;
 
     TRefCountPtr<FRDGPooledBuffer> ProxyParticleBuf = ProxyParticlePooledBuffer;
     TRefCountPtr<FRDGPooledBuffer> HighResRestPosPooledBuf = HighResRestPosPooledBuffer;
@@ -2763,8 +2737,6 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
     TRefCountPtr<FRDGPooledBuffer> D_InfoBuf = DihedralNeighborInfoPooledBuffer;
     TRefCountPtr<FRDGPooledBuffer> D_AdjBuf = DihedralAdjacencyPooledBuffer;
     int32 NumDihedrals = bUse_DihedralBending ? DihedralConstraints.Num() : 0;
-    bool bLocalUseDFCollision = bUseDistanceFieldCollision;
-    TSharedPtr<FSoftBodyGDFCacheData, ESPMode::ThreadSafe> LocalGDFCache = GDFCache;
     ENQUEUE_RENDER_COMMAND(DispatchSoftBodyXPBD)(
         [=, this](FRHICommandListImmediate& RHICmdList)
         {
@@ -3050,36 +3022,9 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
                     FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideStick"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
                 }
             }
-            // ========== 全局距离场碰撞 ==========
-            if (bLocalUseDFCollision && LocalGDFCache.IsValid() && LocalGDFCache->bValid
-                && LocalGDFCache->GDFData.PageAtlasTexture && LocalGDFCache->GDFData.PageTableTexture)
-            {
-                FRDGTextureRef GDFPageAtlasRDG = RegisterExternalTexture(GraphBuilder, LocalGDFCache->GDFData.PageAtlasTexture, TEXT("GDFPageAtlas"));
-                FRDGTextureRef GDFPageTableRDG = RegisterExternalTexture(GraphBuilder, LocalGDFCache->GDFData.PageTableTexture, TEXT("GDFPageTable"));
 
-                TShaderMapRef<FCollideGDFCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-                auto* Params = GraphBuilder.AllocParameters<FCollideGDFCS::FParameters>();
-                Params->RWParticles = ProxyParticleUAV;
-                Params->GDFPageAtlasTexture = GDFPageAtlasRDG;
-                Params->GDFPageTableTexture = GDFPageTableRDG;
-                Params->GDFPageAtlasSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-                for (int32 i = 0; i < GlobalDistanceField::MaxClipmaps; ++i)
-                {
-                    Params->GDFTranslatedCenterAndExtent[i] = LocalGDFCache->GDFData.TranslatedCenterAndExtent[i];
-                    Params->GDFTranslatedWorldToUVAddAndMul[i] = LocalGDFCache->GDFData.TranslatedWorldToUVAddAndMul[i];
-                }
-                Params->GDFInvPageAtlasSize = FVector3f(LocalGDFCache->GDFData.InvPageAtlasSize);
-                Params->GDFClipmapSizeInPages = (uint32)LocalGDFCache->GDFData.ClipmapSizeInPages;
-                Params->GDFVolumeTexelSize = 1.0f / LocalGDFCache->GDFData.GlobalDFResolution;
-                Params->NumGDFClipmaps = (uint32)LocalGDFCache->GDFData.NumGlobalSDFClipmaps;
-                Params->ParticleCount = (uint32)NumParticles;
-                Params->ParticleRadius = PartR;
-                Params->PreViewTranslation = FVector3f(LocalGDFCache->PreViewTranslation);
-                Params->SubstepTime = SubstepDt;
-                Params->GDFFriction = LocalFriction;
-
-                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideGDF"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
-            }
+            // ========== 全局距离场碰撞 (从缓存读稳定纹理) ==========
+            AddGDFCollisionPass(GraphBuilder);
 
             // 4. 更新速度
             {
@@ -3250,6 +3195,94 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
             GraphBuilder.Execute();
         }
     );
+}
+
+void UMySoftBodyMeshComponent::ExtractGDF(FRDGBuilder& GraphBuilder, const FViewInfo& View)
+{
+    if (!View.GlobalDistanceFieldInfo.bInitialized || !GDFCache.IsValid())
+    {
+        if (GDFCache.IsValid()) GDFCache->bValid = false;
+        return;
+    }
+
+    const FGlobalDistanceFieldParameterData& GDFParams = View.GlobalDistanceFieldInfo.ParameterData;
+    if (!GDFParams.PageAtlasTexture || !GDFParams.PageTableTexture)
+    {
+        GDFCache->bValid = false;
+        return;
+    }
+
+    // 页表纹理源与引擎 UpdateParameterData 一致: 优先组合纹理
+    IPooledRenderTarget* PageTablePooled = View.GlobalDistanceFieldInfo.PageTableCombinedTexture.GetReference();
+    if (!PageTablePooled)
+    {
+        PageTablePooled = View.GlobalDistanceFieldInfo.PageTableLayerTextures[GDF_Full].GetReference();
+    }
+    if (!PageTablePooled)
+    {
+        GDFCache->bValid = false;
+        return;
+    }
+
+    // 用 QueueTextureExtraction 提取稳定引用 (RDG 保证纹理不会被池回收覆盖)
+    GraphBuilder.QueueTextureExtraction(
+        GraphBuilder.RegisterExternalTexture(TRefCountPtr<IPooledRenderTarget>(View.GlobalDistanceFieldInfo.PageAtlasTexture.GetReference()), TEXT("SoftBodyGDFPageAtlas")),
+        &GDFCache->PageAtlasPooled);
+    GraphBuilder.QueueTextureExtraction(
+        GraphBuilder.RegisterExternalTexture(TRefCountPtr<IPooledRenderTarget>(PageTablePooled), TEXT("SoftBodyGDFPageTable")),
+        &GDFCache->PageTablePooled);
+
+    GDFCache->GDFData = GDFParams;
+    GDFCache->PreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
+    GDFCache->bValid = true;
+}
+
+void UMySoftBodyMeshComponent::AddGDFCollisionPass(FRDGBuilder& GraphBuilder)
+{
+    if (!bUseDistanceFieldCollision || !bGPUResourcesInitialized || !ProxyParticlePooledBuffer.IsValid())
+    {
+        return;
+    }
+    if (!GDFCache.IsValid() || !GDFCache->bValid
+        || !GDFCache->PageAtlasPooled.IsValid() || !GDFCache->PageTablePooled.IsValid())
+    {
+        return;
+    }
+
+    int32 NumParticles = ProxyParticleCount;
+    uint32 ParticleGroups = FMath::DivideAndRoundUp((uint32)NumParticles, 64u);
+
+    FRDGBufferRef ProxyParticleRDG = GraphBuilder.RegisterExternalBuffer(ProxyParticlePooledBuffer);
+    auto ProxyParticleUAV = GraphBuilder.CreateUAV(ProxyParticleRDG);
+
+    FRDGTextureRef GDFPageAtlasRDG = GraphBuilder.RegisterExternalTexture(GDFCache->PageAtlasPooled, TEXT("SoftBodyGDFPageAtlas"));
+    FRDGTextureRef GDFPageTableRDG = GraphBuilder.RegisterExternalTexture(GDFCache->PageTablePooled, TEXT("SoftBodyGDFPageTable"));
+
+    const FGlobalDistanceFieldParameterData& GDFParams = GDFCache->GDFData;
+
+    TShaderMapRef<FCollideGDFCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+    auto* Params = GraphBuilder.AllocParameters<FCollideGDFCS::FParameters>();
+    Params->RWParticles = ProxyParticleUAV;
+    Params->GlobalDistanceFieldPageAtlasTexture = GDFPageAtlasRDG;
+    Params->GlobalDistanceFieldPageTableTexture = GDFPageTableRDG;
+    Params->GlobalDistanceFieldPageAtlasTextureSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+    for (int32 i = 0; i < GlobalDistanceField::MaxClipmaps; ++i)
+    {
+        Params->GlobalVolumeTranslatedCenterAndExtent[i] = GDFParams.TranslatedCenterAndExtent[i];
+        Params->GlobalVolumeTranslatedWorldToUVAddAndMul[i] = GDFParams.TranslatedWorldToUVAddAndMul[i];
+    }
+    Params->GlobalDistanceFieldInvPageAtlasSize = FVector3f(GDFParams.InvPageAtlasSize);
+    Params->GlobalDistanceFieldClipmapSizeInPages = (uint32)GDFParams.ClipmapSizeInPages;
+    Params->GlobalVolumeTexelSize = 1.0f / GDFParams.GlobalDFResolution;
+    Params->NumGlobalSDFClipmaps = (uint32)GDFParams.NumGlobalSDFClipmaps;
+    Params->ParticleCount = (uint32)NumParticles;
+    Params->ParticleRadius = ParticleRadius;
+    Params->PreViewTranslation = FVector3f(GDFCache->PreViewTranslation);
+    Params->SubstepTime = St;
+    Params->GDFFriction = CollisionFriction;
+    Params->GDFSkinOffset = GDFSkinOffset;
+
+    FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollideGDF"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
 }
 
 void UMySoftBodyMeshComponent::ReadbackGPUPositions()
