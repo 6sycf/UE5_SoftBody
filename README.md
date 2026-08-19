@@ -31,7 +31,7 @@ ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
 - **Geomagic OpenHaptics** 触觉设备（可选，仅触觉交互需要；当前默认禁用）
 - 已启用插件：`ModelingToolsEditorMode`（仅编辑器）、`GeometryScripting`、`SoftBodyGPU`
 
-> OpenHaptics 的头文件与库已在 `ThirdParty/OpenHaptics` 内。触觉集成默认关闭（`SoftBody.Build.cs` 中 `bUseOpenHaptics = false`），启用时需额外把 `PhantomIoLib42.dll`（SDK bin 目录）放进 `ThirdParty/OpenHaptics/lib/x64/Release/`。
+> OpenHaptics SDK 未包含在本仓库（3D Systems 版权物）。如需触觉交互，需自行从 3D Systems 下载 OpenHaptics SDK，把 `include/` 和 `lib/` 放到 `ThirdParty/OpenHaptics/` 下，再按下方说明启用。触觉集成默认关闭（`SoftBody.Build.cs` 中 `bUseOpenHaptics = false`）。
 
 ## 快速开始
 
@@ -41,7 +41,7 @@ ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
 4. 点击 **Build Cloth State**（或游戏运行时 `OnRegister` 自动构建）。
 5. 勾选 **Simulate** 开始模拟，调整子步长、刚度等参数。
 
-**触觉交互（可选，当前默认禁用）**：需先把 `SoftBody.Build.cs` 中 `bUseOpenHaptics` 改为 `true` 并重新构建；场景中放置带 **`UOpenHapticsComponent`** 的 Actor，软体组件会在 `BeginPlay` 自动查找并绑定；勾选软体组件的 **Enable Haptic Interaction** 即可用触觉笔戳软体。
+**触觉交互（可选，默认禁用）**：先下载 OpenHaptics SDK 放到 `ThirdParty/OpenHaptics/`（结构：`include/HD/hd.h`、`lib/x64/Release/hd.lib` 等），把 `SoftBody.Build.cs` 中 `bUseOpenHaptics` 改为 `true` 并重新构建；场景中放置带 **`UOpenHapticsComponent`** 的 Actor，软体组件会在 `BeginPlay` 自动查找并绑定；勾选软体组件的 **Enable Haptic Interaction** 即可用触觉笔戳软体。
 
 **全局距离场碰撞（GPU）**：项目设置开启 **Generate Mesh Distance Fields**（`r.GenerateMeshDistanceFields=1`）并为静态网格体构建距离场，组件勾选 **`bUseDistanceFieldCollision`**（需 `bUseGPU`）。`Config/DefaultEngine.ini` 已配好 `r.AOGlobalDistanceField.DetailedNecessityCheck=0` 与 `r.DistanceFields.SupportEvenIfHardwareRayTracingSupported=1`。
 

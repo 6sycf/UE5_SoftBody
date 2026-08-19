@@ -44,7 +44,7 @@ git reset --hard <提交号>         # 硬回到某版本（丢弃之后的所�
 - `Plugins/` —— 插件源码与着色器
 - `Config/` —— UE 配置
 - `Content/` —— 所有资产（模型 / 材质 / 蓝图 / 关卡）
-- `ThirdParty/` —— OpenHaptics 库
+- `ThirdParty/` —— 第三方库（OpenHaptics SDK 属商业版权物，**不纳入**，见 `.gitignore`）
 - `*.uproject`
 
 **不纳入（引擎自动生成，无需备份）：**

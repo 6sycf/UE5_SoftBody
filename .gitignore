@@ -31,3 +31,7 @@ Plugins/*/Intermediate/
 *.suo
 
 # ---- 保留：Source、Content、Config、Plugins/Source、Shaders、uplugin、ThirdParty ----
+
+# ---- 商业 SDK（不纳入公开仓库，使用者自行下载）----
+# Geomagic OpenHaptics SDK 头文件/库/DLL 属 3D Systems 版权物
+ThirdParty/OpenHaptics/
