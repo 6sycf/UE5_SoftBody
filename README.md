@@ -1,6 +1,8 @@
 # SoftBody_XPBDGPU
 
-基于 **Unreal Engine 5.6** 的软体形变模拟项目。物理求解采用 **XPBD（Extended Position Based Dynamics）**，基于 **GPU 计算**、**高/低模代理 LOD**，支持 **全局距离场（GDF）静态网格体碰撞**，并集成 **Geomagic OpenHaptics** 触觉力反馈设备的双向耦合交互（当前默认禁用，见下文）。
+基于 **Unreal Engine 5.6** 的软体形变模拟项目。物理求解采用 **XPBD（Extended Position Based Dynamics）**，基于 **GPU 计算**、**高/低模代理 LOD**，支持 **全局距离场（GDF）静态网格体碰撞**，并支持用 **3D 交互笔（Geomagic OpenHaptics 设备）** 在三维空间中戳动软体（当前默认禁用，见下文）。
+
+> 说明：这里所谓的"触觉"本质只是**用笔在三维空间定位/交互**——把设备当作 3D 输入笔去戳软体、软体实时形变，并非力反馈（haptic feedback）体验。
 
 ## 功能特性
 
@@ -9,29 +11,36 @@
 - **代理 LOD（Proxy）**：用网格简化生成低模 `ProxyMesh` 做物理计算，高模通过重心坐标 + 法线偏移（`FScaffoldBinding`）绑定到低模，低模驱动高模。
 - **VAT 渲染（纯 GPU 变形）**：把高模顶点位移/法线导出到两张 RenderTarget 纹理，材质采样驱动变形，极大提升帧率。
 - **全局距离场碰撞（GPU）**：`CollideGDFCS` 采样 UE 全局距离场（Page Atlas 稀疏 clipmap），粒子按 SDF 距离 + 梯度推出表面，含速度修正（恢复系数 0 + 摩擦）。
-- **触觉交互（可选，默认禁用）**：集成 Geomagic OpenHaptics，1000Hz 线程读取硬件，双向耦合（软体推笔、笔反馈力）。由 `SoftBody.Build.cs` 里的 `bUseOpenHaptics` 开关控制。
+- **3D 交互笔（可选，默认禁用）**：集成 Geomagic OpenHaptics 设备作为 3D 空间输入笔，1000Hz 线程读取笔尖位置，软体实时形变。由 `SoftBody.Build.cs` 里的 `bUseOpenHaptics` 开关控制。
 
 ## 目录结构
 
 ```
-Source/SoftBody/                 # 游戏模块
+SoftBody_XPBDGPU.uproject         # 项目文件
+Source/SoftBody/                  # 游戏模块
+  ├─ SoftBody.Build.cs            # 模块构建（含 OpenHaptics 开关）
   ├─ Public/MySoftBodyMeshComponent.h   # 软体组件（核心）
-  ├─ Public/OpenHapticsComponent.h      # 触觉设备组件
-  └─ Private/*.cpp
-Plugins/SoftBodyGPU/             # GPU 计算插件（独立 Runtime 模块）
-  ├─ Source/SoftBodyGPU/         # Compute Shader 定义与调度
-  └─ Shaders/Private/SoftBodyCompute.usf  # HLSL 实现
-ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
+  ├─ Public/OpenHapticsComponent.h      # 3D 交互笔组件
+  └─ Private/*.cpp                      # 实现（GPU 模拟、GDF 碰撞、交互笔等）
+Plugins/SoftBodyGPU/              # GPU 计算插件（独立 Runtime 模块）
+  ├─ SoftBodyGPU.uplugin
+  ├─ Source/SoftBodyGPU/
+  │   ├─ Public/SoftBodyComputeShader.h  # Compute Shader 参数定义
+  │   └─ Private/*.cpp                    # Shader 注册与模块
+  └─ Shaders/Private/SoftBodyCompute.usf # HLSL 实现（约 18 个 Kernel）
+Config/                           # UE 配置（距离场/渲染设置等）
+Content/                          # 关卡与资产
+ThirdParty/OpenHaptics/           # OpenHaptics SDK 放置处（用户自行下载，不纳入仓库）
 ```
 
 ## 环境要求
 
 - **Unreal Engine 5.6**（源码版或安装版均可）
 - **Visual Studio 2022**（C++ 编译）
-- **Geomagic OpenHaptics** 触觉设备（可选，仅触觉交互需要；当前默认禁用）
+- **Geomagic OpenHaptics 设备**（可选，仅 3D 交互笔需要；当前默认禁用）
 - 已启用插件：`ModelingToolsEditorMode`（仅编辑器）、`GeometryScripting`、`SoftBodyGPU`
 
-> OpenHaptics SDK 未包含在本仓库（3D Systems 版权物）。如需触觉交互，需自行从 3D Systems 下载 OpenHaptics SDK，把 `include/` 和 `lib/` 放到 `ThirdParty/OpenHaptics/` 下，再按下方说明启用。触觉集成默认关闭（`SoftBody.Build.cs` 中 `bUseOpenHaptics = false`）。
+> OpenHaptics SDK 未包含在本仓库（3D Systems 版权物）。如需 3D 交互笔，需自行从 3D Systems 下载 OpenHaptics SDK，把 `include/` 和 `lib/` 放到 `ThirdParty/OpenHaptics/` 下，再按下方说明启用。笔交互默认关闭（`SoftBody.Build.cs` 中 `bUseOpenHaptics = false`）。
 
 ## 快速开始
 
@@ -41,7 +50,7 @@ ThirdParty/OpenHaptics/          # Geomagic OpenHaptics SDK（HD/HL）
 4. 点击 **Build Cloth State**（或游戏运行时 `OnRegister` 自动构建）。
 5. 勾选 **Simulate** 开始模拟，调整子步长、刚度等参数。
 
-**触觉交互（可选，默认禁用）**：先下载 OpenHaptics SDK 放到 `ThirdParty/OpenHaptics/`（结构：`include/HD/hd.h`、`lib/x64/Release/hd.lib` 等），把 `SoftBody.Build.cs` 中 `bUseOpenHaptics` 改为 `true` 并重新构建；场景中放置带 **`UOpenHapticsComponent`** 的 Actor，软体组件会在 `BeginPlay` 自动查找并绑定；勾选软体组件的 **Enable Haptic Interaction** 即可用触觉笔戳软体。
+**3D 交互笔（可选，默认禁用）**：先下载 OpenHaptics SDK 放到 `ThirdParty/OpenHaptics/`（结构：`include/HD/hd.h`、`lib/x64/Release/hd.lib` 等），把 `SoftBody.Build.cs` 中 `bUseOpenHaptics` 改为 `true` 并重新构建；场景中放置带 **`UOpenHapticsComponent`** 的 Actor，软体组件会在 `BeginPlay` 自动查找并绑定；勾选软体组件的 **Enable Haptic Interaction** 即可用笔在三维空间中戳动软体（软体实时形变，非力反馈）。
 
 **全局距离场碰撞（GPU）**：项目设置开启 **Generate Mesh Distance Fields**（`r.GenerateMeshDistanceFields=1`）并为静态网格体构建距离场，组件勾选 **`bUseDistanceFieldCollision`**（需 `bUseGPU`）。`Config/DefaultEngine.ini` 已配好 `r.AOGlobalDistanceField.DetailedNecessityCheck=0` 与 `r.DistanceFields.SupportEvenIfHardwareRayTracingSupported=1`。
 
@@ -70,7 +79,7 @@ GPU 求解在 `Plugins/SoftBodyGPU` 中实现，`SoftBodyCompute.usf` 包含约 
 IntegrateCS（重力积分）
   → ClearLambdasCS
   → 迭代 { SolveAndApplyCS（距离约束 Jacobi）/ SolveDihedralCS（二面角）/ UpdateLambdasCS }
-  → CollideStickCS（触觉笔）/ CollideGDFCS（全局距离场碰撞）
+  → CollideStickCS（交互笔）/ CollideGDFCS（全局距离场碰撞）
   → UpdateVelocityCS
   → 法线 / 体积 / 导出（ExportToTextureCS 等）
 ```
@@ -80,7 +89,7 @@ IntegrateCS（重力积分）
 ## 碰撞
 
 - **全局距离场**：`CollideGDFCS`（采样 UE 全局距离场，静态网格体碰撞）。
-- **触觉笔**：`CollideStickCS` / `CollideWithHapticStylus`（胶囊体 SDF）。
+- **3D 交互笔**：`CollideStickCS` / `CollideWithHapticStylus`（胶囊体 SDF，笔戳软体形变）。
 
 > 已知限制：全局距离场碰撞只覆盖静态网格体，动态物体不在 GDF 中；分辨率随离相机距离下降。
 
