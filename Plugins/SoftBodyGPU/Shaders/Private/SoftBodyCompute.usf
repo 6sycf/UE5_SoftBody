@@ -840,3 +840,149 @@ void CollideGDFCS(uint3 DTid : SV_DispatchThreadID)
         RWParticles[idx] = P;
     }
 }
+
+// =========================================================
+// 动态碰撞体 (球/盒/胶囊)
+// 遍历所有动态碰撞体，把穿透粒子推出表面并做相对速度摩擦/反弹。
+// Shape: 0=球, 1=盒, 2=胶囊
+// =========================================================
+struct FCollider
+{
+    int Shape;
+    float Radius;
+    float CapsuleHalfHeight;
+    float3 Center;
+    float3 AxisX;
+    float3 AxisY;
+    float3 AxisZ;
+    float3 HalfExtents;
+    float3 Velocity;
+    float Friction;
+    float Restitution;
+};
+
+StructuredBuffer<FCollider> Colliders;
+uint ColliderCount;
+
+// 求粒子 P 到碰撞体表面的有符号距离 d (d<0 表示在内部)，
+// 同时输出表面最近点 ClosestPoint 和指向外侧的法线 Normal。
+float ColliderSDF(FCollider C, float3 P, out float3 ClosestPoint, out float3 Normal)
+{
+    float d = 0.0f;
+
+    if (C.Shape == 0) // 球
+    {
+        float3 toP = P - C.Center;
+        float len = length(toP);
+        if (len < 1e-6f)
+        {
+            Normal = float3(0, 0, 1);
+            ClosestPoint = C.Center + Normal * C.Radius;
+            d = -C.Radius;
+        }
+        else
+        {
+            Normal = toP / len;
+            ClosestPoint = C.Center + Normal * C.Radius;
+            d = len - C.Radius;
+        }
+    }
+    else if (C.Shape == 1) // 盒 (OBB)
+    {
+        float3 localP = P - C.Center;
+        float3 lp = float3(dot(localP, C.AxisX), dot(localP, C.AxisY), dot(localP, C.AxisZ));
+        float3 q = abs(lp) - C.HalfExtents;
+        float3 maxq = max(q, 0.0);
+        float outsideDist = length(maxq);
+        float insideDist = min(max(q.x, max(q.y, q.z)), 0.0);
+        d = outsideDist + insideDist;
+
+        float3 localNormal;
+        float3 localClosest;
+        if (outsideDist > 0.0)
+        {
+            localNormal = maxq / outsideDist;
+            localClosest = clamp(lp, -C.HalfExtents, C.HalfExtents);
+        }
+        else
+        {
+            // 在盒内部或表面：沿最近的面推出
+            if (q.x >= q.y && q.x >= q.z)
+                localNormal = float3(sign(lp.x), 0, 0);
+            else if (q.y >= q.z)
+                localNormal = float3(0, sign(lp.y), 0);
+            else
+                localNormal = float3(0, 0, sign(lp.z));
+            localClosest = lp;
+        }
+
+        Normal = localNormal.x * C.AxisX + localNormal.y * C.AxisY + localNormal.z * C.AxisZ;
+        ClosestPoint = C.Center + localClosest.x * C.AxisX + localClosest.y * C.AxisY + localClosest.z * C.AxisZ;
+    }
+    else // 胶囊
+    {
+        float3 A = C.Center - C.AxisZ * C.CapsuleHalfHeight;
+        float3 B = C.Center + C.AxisZ * C.CapsuleHalfHeight;
+        float3 AB = B - A;
+        float abLenSq = dot(AB, AB);
+        float t = (abLenSq > 1e-6f) ? saturate(dot(P - A, AB) / abLenSq) : 0.0f;
+        float3 closest = A + AB * t;
+        float3 toP = P - closest;
+        float len = length(toP);
+        if (len < 1e-6f)
+        {
+            Normal = C.AxisZ;
+            ClosestPoint = closest + Normal * C.Radius;
+            d = -C.Radius;
+        }
+        else
+        {
+            Normal = toP / len;
+            ClosestPoint = closest + Normal * C.Radius;
+            d = len - C.Radius;
+        }
+    }
+
+    return d;
+}
+
+[numthreads(64, 1, 1)]
+void CollidePrimitivesCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= ParticleCount) return;
+    if (ColliderCount == 0) return;
+
+    FSoftBodyParticle P = RWParticles[idx];
+    if (P.State == 0) return;
+
+    for (uint c = 0; c < ColliderCount; ++c)
+    {
+        FCollider C = Colliders[c];
+
+        float3 ClosestPoint;
+        float3 Normal;
+        float d = ColliderSDF(C, P.Position, ClosestPoint, Normal);
+
+        float CollisionDepth = ParticleRadius - d;
+        if (CollisionDepth > 0.0f)
+        {
+            // 防止粒子深陷内部时被推出过远
+            CollisionDepth = min(CollisionDepth, ParticleRadius * 2.0f);
+
+            // 速度响应：相对速度 (粒子 - 碰撞体)，切线摩擦 + 法向反弹
+            float3 Vel = (P.Position - P.PrevPosition) / SubstepTime;
+            float3 RelVel = Vel - C.Velocity;
+            float Vn = dot(RelVel, Normal);
+            float3 Vt = RelVel - Normal * Vn;
+            float VnNew = Vn < 0.0f ? (-Vn * C.Restitution) : Vn;
+            Vt *= saturate(1.0f - C.Friction);
+            float3 NewVel = C.Velocity + Normal * VnNew + Vt;
+
+            P.Position += Normal * CollisionDepth;
+            P.PrevPosition = P.Position - NewVel * SubstepTime;
+        }
+    }
+
+    RWParticles[idx] = P;
+}

@@ -8,6 +8,7 @@
 #include "GeometryScript/MeshAssetFunctions.h"
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "OpenHapticsComponent.h"
+#include "SoftBodyColliderComponent.h"
 #include "DynamicMesh/DynamicMeshAABBTree3.h"
 #include "GeometryScript/MeshRepairFunctions.h"
 #include "DynamicMesh/MeshTangents.h"
@@ -255,6 +256,50 @@ void UMySoftBodyMeshComponent::BeginPlay()
     {
         UE_LOG(LogTemp, Warning, TEXT("SoftBody: No Haptics Component found! Interaction will be disabled."));
     }
+
+    // 自动扫描场景里的动态碰撞体组件 (球/盒/胶囊)
+    if (bUseDynamicColliders)
+    {
+        DynamicColliders.Empty();
+        UWorld* World = GetWorld();
+        if (World)
+        {
+            for (TActorIterator<AActor> It(World); It; ++It)
+            {
+                TArray<USoftBodyColliderComponent*> FoundColliders;
+                It->GetComponents<USoftBodyColliderComponent>(FoundColliders);
+                for (USoftBodyColliderComponent* Col : FoundColliders)
+                {
+                    if (Col)
+                    {
+                        DynamicColliders.AddUnique(Col);
+                    }
+                }
+            }
+        }
+        UE_LOG(LogTemp, Log, TEXT("SoftBody: Auto-registered %d dynamic colliders."), DynamicColliders.Num());
+    }
+}
+
+void UMySoftBodyMeshComponent::RegisterCollider(USoftBodyColliderComponent* Collider)
+{
+    if (Collider)
+    {
+        DynamicColliders.AddUnique(Collider);
+    }
+}
+
+void UMySoftBodyMeshComponent::UnregisterCollider(USoftBodyColliderComponent* Collider)
+{
+    if (Collider)
+    {
+        DynamicColliders.Remove(Collider);
+    }
+}
+
+void UMySoftBodyMeshComponent::ClearColliders()
+{
+    DynamicColliders.Empty();
 }
 
 void UMySoftBodyMeshComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -2737,6 +2782,38 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
     TRefCountPtr<FRDGPooledBuffer> D_InfoBuf = DihedralNeighborInfoPooledBuffer;
     TRefCountPtr<FRDGPooledBuffer> D_AdjBuf = DihedralAdjacencyPooledBuffer;
     int32 NumDihedrals = bUse_DihedralBending ? DihedralConstraints.Num() : 0;
+
+    // =========================================================
+    // 收集动态碰撞体数据 (球/盒/胶囊) —— 每帧在游戏线程收集
+    // =========================================================
+    TArray<FGPUCollider> ColliderData;
+    if (bUseDynamicColliders)
+    {
+        ColliderData.Reserve(DynamicColliders.Num());
+        for (const TWeakObjectPtr<USoftBodyColliderComponent>& WeakCol : DynamicColliders)
+        {
+            USoftBodyColliderComponent* Col = WeakCol.Get();
+            if (!Col || !Col->bEnabled) continue;
+
+            FSoftBodyColliderPrimitive Prim;
+            Col->GetWorldCollider(Prim);
+
+            FGPUCollider G;
+            G.Shape = static_cast<int32>(Prim.Shape);
+            G.Radius = Prim.Radius;
+            G.CapsuleHalfHeight = Prim.CapsuleHalfHeight;
+            G.Center = FVector3f(Prim.Center);
+            G.AxisX = FVector3f(Prim.Rotation.GetAxisX());
+            G.AxisY = FVector3f(Prim.Rotation.GetAxisY());
+            G.AxisZ = FVector3f(Prim.Rotation.GetAxisZ());
+            G.HalfExtents = FVector3f(Prim.HalfExtents);
+            G.Velocity = FVector3f(Prim.Velocity);
+            G.Friction = Prim.Friction;
+            G.Restitution = Prim.Restitution;
+            ColliderData.Add(G);
+        }
+    }
+
     ENQUEUE_RENDER_COMMAND(DispatchSoftBodyXPBD)(
         [=, this](FRHICommandListImmediate& RHICmdList)
         {
@@ -3025,6 +3102,23 @@ void UMySoftBodyMeshComponent::DispatchGPUCompute(bool bIsLastSubstep)
 
             // ========== 全局距离场碰撞 (从缓存读稳定纹理) ==========
             AddGDFCollisionPass(GraphBuilder);
+
+            // ========== 动态碰撞体碰撞 (球/盒/胶囊) ==========
+            if (ColliderData.Num() > 0)
+            {
+                FRDGBufferRef ColliderRDG = CreateStructuredBuffer(GraphBuilder, TEXT("SoftBodyColliders"), ColliderData);
+                auto ColliderSRV = GraphBuilder.CreateSRV(ColliderRDG);
+
+                TShaderMapRef<FCollidePrimitivesCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+                auto* Params = GraphBuilder.AllocParameters<FCollidePrimitivesCS::FParameters>();
+                Params->RWParticles = ProxyParticleUAV;
+                Params->Colliders = ColliderSRV;
+                Params->ColliderCount = (uint32)ColliderData.Num();
+                Params->ParticleCount = (uint32)NumParticles;
+                Params->ParticleRadius = PartR;
+                Params->SubstepTime = SubstepDt;
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("CollidePrimitives"), Shader, Params, FIntVector(ParticleGroups, 1, 1));
+            }
 
             // 4. 更新速度
             {

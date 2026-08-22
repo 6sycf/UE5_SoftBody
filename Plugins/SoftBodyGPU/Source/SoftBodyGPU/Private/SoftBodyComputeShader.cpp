@@ -26,3 +26,4 @@ IMPLEMENT_GLOBAL_SHADER(FSolveDihedralCS, "/SoftBodyGPU/Private/SoftBodyCompute.
 IMPLEMENT_GLOBAL_SHADER(FUpdateDihedralLambdasCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "UpdateDihedralLambdasCS", SF_Compute); 
 IMPLEMENT_GLOBAL_SHADER(FExportToTextureCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "ExportToTextureCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FCollideGDFCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "CollideGDFCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FCollidePrimitivesCS, "/SoftBodyGPU/Private/SoftBodyCompute.usf", "CollidePrimitivesCS", SF_Compute);

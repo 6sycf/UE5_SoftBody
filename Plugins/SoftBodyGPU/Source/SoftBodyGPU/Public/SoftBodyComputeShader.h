@@ -50,6 +50,22 @@ struct FGPUTriangle
 {
     int32 A; int32 B; int32 C;
 };
+// 动态碰撞体结构 (与 HLSL 里的 FCollider 严格同序同布局)
+// Shape: 0=球, 1=盒, 2=胶囊
+struct FGPUCollider
+{
+    int32 Shape;
+    float Radius;
+    float CapsuleHalfHeight;
+    FVector3f Center;
+    FVector3f AxisX;
+    FVector3f AxisY;
+    FVector3f AxisZ;
+    FVector3f HalfExtents;
+    FVector3f Velocity;
+    float Friction;
+    float Restitution;
+};
 // =========================================================
 // Shader 基类
 // =========================================================
@@ -421,5 +437,25 @@ public:
         SHADER_PARAMETER(float, SubstepTime)
         SHADER_PARAMETER(float, GDFFriction)
         SHADER_PARAMETER(float, GDFSkinOffset)
+    END_SHADER_PARAMETER_STRUCT()
+};
+
+// =========================================================
+// Kernel 19: 动态碰撞体碰撞 (球/盒/胶囊)
+// 遍历所有动态碰撞体，把穿透粒子推出表面并做相对速度摩擦/反弹。
+// =========================================================
+class SOFTBODYGPU_API FCollidePrimitivesCS : public FSoftBodyShaderBase
+{
+public:
+    DECLARE_GLOBAL_SHADER(FCollidePrimitivesCS);
+    SHADER_USE_PARAMETER_STRUCT(FCollidePrimitivesCS, FSoftBodyShaderBase);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FGPUParticle>, RWParticles)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUCollider>, Colliders)
+        SHADER_PARAMETER(uint32, ColliderCount)
+        SHADER_PARAMETER(uint32, ParticleCount)
+        SHADER_PARAMETER(float, ParticleRadius)
+        SHADER_PARAMETER(float, SubstepTime)
     END_SHADER_PARAMETER_STRUCT()
 };

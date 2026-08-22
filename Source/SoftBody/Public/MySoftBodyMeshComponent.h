@@ -13,6 +13,7 @@
 // 前置声明
 struct FMySoftBodyConstraint;
 class UOpenHapticsComponent;
+class USoftBodyColliderComponent;
 class FRHIGPUBufferReadback;
 class ISceneViewExtension;
 class FGlobalDistanceFieldParameterData;
@@ -201,6 +202,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
     bool bUseDistanceFieldCollision = false;
 
+    // 是否启用动态碰撞体 (球/盒/胶囊) 实时碰撞 (GPU 路径)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Soft Body Simulation")
+    bool bUseDynamicColliders = true;
+
     // GDF 碰撞的接触容差缓冲带 (cm)。把表面"往外扩"这段距离，
     // 粒子在缓冲带内就被稳妥推出，避免在表面边界上来回震荡/穿模。
     // 值太小会抖，值太大会让软体"悬浮"在表面外。默认 1cm。
@@ -287,6 +292,16 @@ public:
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "Soft Body Setup")
     void ResetToInitalState();
 
+    // --- 动态碰撞体注册 (球/盒/胶囊) ---
+    UFUNCTION(BlueprintCallable, Category = "Soft Body Interaction")
+    void RegisterCollider(USoftBodyColliderComponent* Collider);
+
+    UFUNCTION(BlueprintCallable, Category = "Soft Body Interaction")
+    void UnregisterCollider(USoftBodyColliderComponent* Collider);
+
+    UFUNCTION(BlueprintCallable, Category = "Soft Body Interaction")
+    void ClearColliders();
+
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "Soft Body Debug")
     void DBG_ShowParticles() const;
 
@@ -332,6 +347,9 @@ public:
     int32 ProxyTriCount;
     float ParticleRadiusSq;
     void CollideWithHapticStylus(const FVector& V_Start, const FVector& V_End, float Radius);
+
+    // 动态碰撞体列表 (自动扫描 + 运行时注册)
+    TArray<TWeakObjectPtr<USoftBodyColliderComponent>> DynamicColliders;
     
     // 配置
     UPROPERTY(EditAnywhere, Category = "Soft Body Proxy")
